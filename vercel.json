@@ -2,14 +2,14 @@
   "version": 2,
   "builds": [
     {
-      "src": "V8.py",
+      "src": "PatchProof.py",
       "use": "@vercel/python"
     }
   ],
   "routes": [
     {
       "src": "/(.*)",
-      "dest": "V8.py"
+      "dest": "PatchProof.py"
     }
   ]
 }
