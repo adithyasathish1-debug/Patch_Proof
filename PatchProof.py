@@ -4,7 +4,8 @@ PS-02: After
 Glassy Purple Architecture with Pure macOS Cursor, Visual Data Analytics & Live Verification.
 
 Usage:
-    py V8.py
+    run_patchproof_universal.bat  (Windows)
+    py PatchProof_V8_Universal_Web_Inspector.py
 Opens at:
     http://127.0.0.1:5000
 """
@@ -29,16 +30,15 @@ import sys
 import tempfile
 import time
 import threading
-import urllib.request
 import zipfile
+import zlib
 from collections import Counter
 from html.parser import HTMLParser
 from http.client import HTTPConnection
+from http.client import HTTPSConnection, HTTPException
 import textwrap
 from pathlib import Path, PurePosixPath
-from urllib.error import HTTPError
-from urllib.parse import quote, urljoin, urlparse
-from urllib.request import HTTPRedirectHandler, Request, build_opener, HTTPSHandler
+from urllib.parse import urljoin, urlparse
 
 from flask import Flask, jsonify, make_response, render_template_string, request, send_file
 
@@ -50,6 +50,7 @@ MAX_SOURCE_BYTES = 15 * 1024 * 1024
 MAX_SOURCE_FILES = 800
 MAX_CSS_FILES = 15
 MAX_BROWSER_REQUESTS = 120
+SOURCE_SCAN_EXTENSIONS = {".py", ".js", ".jsx", ".ts", ".tsx", ".html", ".css", ".php", ".java"}
 
 PROJECT_WORKSPACE = Path(tempfile.mkdtemp(prefix="patchproof_workspace_"))
 PROJECT_SESSIONS = {}
@@ -335,9 +336,24 @@ def finding(fid, title, category, severity, confidence, evidence_level,
 
 
 def _node_char_span(source: str, node):
+    """Return character offsets for AST nodes (AST columns are UTF-8 byte offsets)."""
     lines = source.splitlines(keepends=True)
-    start = sum(len(lines[i]) for i in range(node.lineno - 1)) + node.col_offset
-    end = sum(len(lines[i]) for i in range(node.end_lineno - 1)) + node.end_col_offset
+
+    def byte_column_to_char(line: str, byte_column: int) -> int:
+        encoded = line.encode("utf-8")
+        if byte_column < 0 or byte_column > len(encoded):
+            raise ValueError("AST column is outside its source line.")
+        try:
+            return len(encoded[:byte_column].decode("utf-8"))
+        except UnicodeDecodeError as exc:
+            raise ValueError("AST column splits a UTF-8 character.") from exc
+
+    if not getattr(node, "end_lineno", None):
+        raise ValueError("AST node has no end position.")
+    start = sum(len(line) for line in lines[:node.lineno - 1])
+    start += byte_column_to_char(lines[node.lineno - 1], node.col_offset)
+    end = sum(len(line) for line in lines[:node.end_lineno - 1])
+    end += byte_column_to_char(lines[node.end_lineno - 1], node.end_col_offset)
     return start, end
 
 
@@ -348,9 +364,17 @@ def detect_sqlite_parameter_patches(source: str, relative: str):
     except SyntaxError:
         return findings, candidates
 
+    imports_sqlite = any(
+        (isinstance(node, ast.Import) and any(alias.name == "sqlite3" for alias in node.names))
+        or (isinstance(node, ast.ImportFrom) and node.module == "sqlite3")
+        for node in tree.body
+    )
+    if not imports_sqlite:
+        return findings, candidates
+
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "execute" and len(node.args) >= 1):
+                and node.func.attr == "execute" and len(node.args) == 1 and not node.keywords):
             continue
 
         expr = node.args[0]
@@ -472,7 +496,9 @@ def detect_access_control_patches(source: str, relative: str):
     for node in tree.body:
         if not (isinstance(node, ast.FunctionDef) and node.name == "can_delete"):
             continue
-        if len(node.args.args) != 1 or len(node.body) != 1:
+        if (len(node.args.args) != 1 or node.args.args[0].arg != "current_user"
+                or node.args.posonlyargs or node.args.vararg or node.args.kwarg
+                or node.args.kwonlyargs or len(node.body) != 1):
             continue
         ret_stmt = node.body[0]
         if not (isinstance(ret_stmt, ast.Return) and isinstance(ret_stmt.value, ast.Constant) and ret_stmt.value.value is True):
@@ -553,13 +579,28 @@ def detect_path_traversal_patches(source: str, relative: str):
     for node in ast.walk(tree):
         if not (isinstance(node, ast.FunctionDef) and node.name == "read_document"):
             continue
-        
+        positional_names = [arg.arg for arg in node.args.posonlyargs + node.args.args]
+        has_os_import = any(
+            isinstance(item, ast.Import) and any(alias.name == "os" for alias in item.names)
+            for item in tree.body
+        )
+        if (positional_names != ["base_dir", "doc_name"] or node.args.kwonlyargs
+                or node.args.vararg or node.args.kwarg or not has_os_import):
+            continue
+
         join_assign = None
         for stmt in node.body:
             if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
                     and isinstance(stmt.targets[0], ast.Name) and stmt.targets[0].id == "target_path"
                     and isinstance(stmt.value, ast.Call) and isinstance(stmt.value.func, ast.Attribute)
-                    and stmt.value.func.attr == "join"):
+                    and stmt.value.func.attr == "join"
+                    and isinstance(stmt.value.func.value, ast.Attribute)
+                    and stmt.value.func.value.attr == "path"
+                    and isinstance(stmt.value.func.value.value, ast.Name)
+                    and stmt.value.func.value.value.id == "os"
+                    and len(stmt.value.args) == 2
+                    and all(isinstance(arg, ast.Name) for arg in stmt.value.args)
+                    and [arg.id for arg in stmt.value.args] == ["base_dir", "doc_name"]):
                 join_assign = stmt
                 break
 
@@ -570,7 +611,11 @@ def detect_path_traversal_patches(source: str, relative: str):
         patched_code = (
             f"base_root = os.path.realpath(base_dir)\n"
             f"{indent}target_path = os.path.realpath(os.path.join(base_root, doc_name))\n"
-            f"{indent}if os.path.commonpath([base_root, target_path]) != base_root:\n"
+            f"{indent}try:\n"
+            f"{indent}    _inside_root = os.path.commonpath([base_root, target_path]) == base_root\n"
+            f"{indent}except ValueError:\n"
+            f"{indent}    _inside_root = False\n"
+            f"{indent}if not _inside_root:\n"
             f"{indent}    raise PermissionError('Path traversal detected')"
         )
 
@@ -1009,7 +1054,7 @@ def audit_source_tree(root: Path):
     findings, patch_candidates, python_files, scanned, skipped = [], [], [], 0, []
     python_sources = {}
     ignored_dirs = {".git", "node_modules", "venv", ".venv", "__pycache__", "dist", "build"}
-    extensions = {".py", ".js", ".jsx", ".ts", ".tsx", ".html", ".css", ".php", ".java"}
+    extensions = SOURCE_SCAN_EXTENSIONS
 
     for path in sorted(root.rglob("*")):
         if not path.is_file():
@@ -1309,13 +1354,18 @@ def _evaluate_read_document_helper(source_code: str, base_dir: str, doc_name: st
     fn = funcs[0]
     has_realpath = any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "realpath" for n in ast.walk(fn))
     has_join = any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "join" for n in ast.walk(fn))
+    has_commonpath = any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "commonpath" for n in ast.walk(fn))
     has_boundary_guard = any(
         isinstance(n, ast.If)
-        and any(isinstance(x, ast.Call) and isinstance(x.func, ast.Attribute) and x.func.attr == "commonpath" for x in ast.walk(n.test))
+        and (
+            any(isinstance(x, ast.Call) and isinstance(x.func, ast.Attribute) and x.func.attr == "commonpath" for x in ast.walk(n.test))
+            or (isinstance(n.test, ast.UnaryOp) and isinstance(n.test.op, ast.Not)
+                and isinstance(n.test.operand, ast.Name) and n.test.operand.id == "_inside_root")
+        )
         and any(isinstance(x, ast.Raise) and any(isinstance(y, ast.Name) and y.id == "PermissionError" for y in ast.walk(x)) for x in ast.walk(n))
-        for n in fn.body
+        for n in ast.walk(fn)
     )
-    if not (has_realpath and has_join and has_boundary_guard):
+    if not (has_realpath and has_join and has_commonpath and has_boundary_guard):
         raise ValueError("Patched read_document() does not show a realpath/commonpath PermissionError guard.")
 
     base_root = os.path.realpath(base_dir)
@@ -1420,63 +1470,1068 @@ def run_regression_suite(project_dir: Path, runner: str = "unittest", timeout: i
 
 
 # ==============================================================================
-# 4. SAFE URL FETCHING & WEB INSPECTION (WITH CERTIFI SSL)
+# 4. SAFE URL FETCHING & WEB INSPECTION (NATIVE VERIFIED TLS + RESILIENT HTTP)
 # ==============================================================================
 
+def _resolve_public_addresses(parsed):
+    """Resolve once per connection and reject a hostname with any non-public answer."""
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        infos = socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)
+        addresses = list(dict.fromkeys(item[4][0].split("%")[0] for item in infos))
+        parsed_addresses = [ipaddress.ip_address(value) for value in addresses]
+    except (OSError, ValueError, TypeError):
+        raise ValueError("The hostname could not be resolved or the URL port is invalid.")
+    if not parsed_addresses or any(not address.is_global for address in parsed_addresses):
+        raise ValueError("Localhost, private networks, and reserved addresses are blocked.")
+    return addresses
+
+
 def safe_public_url(value):
-    parsed = urlparse((value or "").strip())
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+    if not isinstance(value, str):
+        raise ValueError("Enter a valid public http:// or https:// URL.")
+    raw = value.strip()
+    if not raw or any(ord(ch) < 32 for ch in raw):
+        raise ValueError("Enter a valid public http:// or https:// URL without control characters.")
+    parsed = urlparse(raw)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
         raise ValueError("Enter a valid public http:// or https:// URL.")
     if parsed.username or parsed.password:
         raise ValueError("URLs containing embedded credentials are not allowed.")
     try:
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        addresses = {
-            ipaddress.ip_address(item[4][0].split("%")[0])
-            for item in socket.getaddrinfo(parsed.hostname, port)
-        }
-    except (OSError, ValueError):
-        raise ValueError("The hostname could not be resolved or the URL port is invalid.")
-    if not addresses or any(not address.is_global for address in addresses):
-        raise ValueError("Localhost, private networks, and reserved addresses are blocked.")
+        # Validate ports and normalize internationalized domain names before DNS.
+        _ = parsed.port
+        host = parsed.hostname.encode("idna").decode("ascii").lower()
+    except (UnicodeError, ValueError) as exc:
+        raise ValueError("The website hostname or port is invalid.") from exc
+    if host.endswith((".localhost", ".local", ".internal")) or host in {"localhost", "localhost."}:
+        raise ValueError("Localhost and local-only hostnames are blocked.")
+    normalized_netloc = f"[{host}]" if ":" in host else host
+    if parsed.port is not None:
+        normalized_netloc += f":{parsed.port}"
+    parsed = parsed._replace(scheme=parsed.scheme.lower(), netloc=normalized_netloc)
+    _resolve_public_addresses(parsed)
     return parsed.geturl()
 
 
-def fetch_public(url, accept="*/*"):
-    current = safe_public_url(url)
+class _PinnedHTTPConnection(HTTPConnection):
+    """Connect to a previously validated IP while retaining the original Host header."""
+    def __init__(self, host, address, port, timeout=10):
+        self._destination_ip = address
+        super().__init__(host, port=port, timeout=timeout)
 
-    class NoRedirect(HTTPRedirectHandler):
-        def redirect_request(self, req, fp, code, msg, headers, newurl):
-            return None
+    def connect(self):
+        self.sock = socket.create_connection((self._destination_ip, self.port), self.timeout, self.source_address)
+
+
+class _PinnedHTTPSConnection(HTTPSConnection):
+    """TLS connection pinned to a validated IP, with certificate/SNI checks for the host."""
+    def __init__(self, host, address, port, context, timeout=10):
+        self._destination_ip = address
+        super().__init__(host, port=port, timeout=timeout, context=context)
+
+    def connect(self):
+        raw_socket = socket.create_connection((self._destination_ip, self.port), self.timeout, self.source_address)
+        try:
+            server_name = self.host.encode("idna").decode("ascii")
+            self.sock = self._context.wrap_socket(raw_socket, server_hostname=server_name)
+        except Exception:
+            raw_socket.close()
+            raise
+
+
+def build_public_tls_context():
+    """Return a verified TLS context with native OS trust as the preferred backend.
+
+    ``truststore`` delegates certificate validation to Windows CryptoAPI,
+    macOS Security.framework, or the native Linux/OpenSSL trust store. In
+    particular, supported native stores can retrieve missing intermediate
+    certificates through the platform chain engine. If truststore is missing
+    or unsupported, use Python's recommended system context and add certifi.
+
+    An organization-approved PEM root may be added through
+    PATCHPROOF_CA_BUNDLE. No branch disables certificate or hostname checks.
+    A fresh context is created per fetch and is only used sequentially across
+    the destination's already-validated IP addresses.
+    """
+    native_error = None
+    backend = "python-system+certifi"
+    context = None
 
     try:
-        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
-    except Exception:
-        ssl_ctx = ssl.create_default_context()
+        import truststore
+        context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        backend = "native-system-truststore"
+    except (ImportError, OSError, RuntimeError, AttributeError) as exc:
+        native_error = exc
 
-    opener = build_opener(NoRedirect, HTTPSHandler(context=ssl_ctx))
-    for _ in range(4):
+    if context is None:
+        # create_default_context is Python's recommended client configuration:
+        # it enables CERT_REQUIRED + hostname validation and honors OpenSSL's
+        # SSL_CERT_FILE / SSL_CERT_DIR environment settings.
+        context = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
         try:
-            req = Request(
-                current,
-                headers={
-                    "User-Agent": "PatchProof-Security-Inspector/3.4 (+https://patchproof.dev)",
-                    "Accept": accept,
-                },
-            )
-            resp = opener.open(req, timeout=10)
-            data = resp.read(MAX_REMOTE_BYTES + 1)
-            if len(data) > MAX_REMOTE_BYTES:
-                raise ValueError("Remote resource exceeds the inspection size limit.")
-            return data, dict(resp.headers.items()), resp.geturl()
-        except HTTPError as exc:
-            if exc.code not in {301, 302, 303, 307, 308}:
-                raise ValueError(f"Website returned HTTP {exc.code}.")
-            location = exc.headers.get("Location")
+            context.load_verify_locations(cafile=certifi.where())
+        except (OSError, ssl.SSLError) as exc:
+            raise ssl.SSLError(f"Unable to load system and certifi CA certificates: {exc}") from exc
+        if native_error:
+            backend += " (native truststore unavailable)"
+
+    # Ensure client-auth validation remains mandatory even on alternate context
+    # implementations. Truststore performs its native validation internally.
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.check_hostname = True
+    try:
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+    except (AttributeError, ValueError):
+        pass
+
+    custom_bundle = os.environ.get("PATCHPROOF_CA_BUNDLE", "").strip()
+    if custom_bundle:
+        bundle_path = Path(custom_bundle).expanduser()
+        if not bundle_path.is_file():
+            raise FileNotFoundError(f"PATCHPROOF_CA_BUNDLE does not exist: {bundle_path}")
+        try:
+            context.load_verify_locations(cafile=str(bundle_path))
+        except (AttributeError, NotImplementedError, OSError, ssl.SSLError) as exc:
+            # If the native wrapper cannot add an explicit enterprise root,
+            # retain the same strict policy in the OpenSSL context instead.
+            if backend == "native-system-truststore":
+                fallback = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
+                fallback.load_verify_locations(cafile=certifi.where())
+                fallback.load_verify_locations(cafile=str(bundle_path))
+                fallback.minimum_version = ssl.TLSVersion.TLSv1_2
+                fallback.verify_mode = ssl.CERT_REQUIRED
+                fallback.check_hostname = True
+                context = fallback
+                backend = "python-system+certifi+custom-CA (truststore custom-CA API unavailable)"
+            else:
+                raise ssl.SSLError(f"Unable to load PATCHPROOF_CA_BUNDLE: {exc}") from exc
+
+    # This marker is diagnostic metadata only; it does not alter TLS behaviour.
+    try:
+        context._patchproof_tls_backend = backend
+    except Exception:
+        pass
+    return context
+
+
+def build_unverified_diagnostic_tls_context():
+    """TLS encryption without peer authentication, for passive diagnostics ONLY.
+
+    This context is never used by preview, website sandbox, or any feature that
+    executes page JavaScript. The inspector sends only an anonymous GET, stores
+    no cookies, does not submit forms, and prominently labels the result as
+    TLS-unverified. It is not a trusted connection and must never be represented
+    as one. Normal verified TLS is always attempted first.
+    """
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    try:
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+    except (AttributeError, ValueError):
+        pass
+    return context
+
+
+def unverified_tls_diagnostics_enabled():
+    """Opt-in only. Set PATCHPROOF_ALLOW_UNVERIFIED_TLS_DIAGNOSTIC=1 to allow it.
+
+    The default is OFF so the product behaves exactly as its UI promises:
+    certificate and hostname verification are never disabled unless the
+    operator explicitly asks for a passive, clearly-marked diagnostic fetch.
+    """
+    value = os.environ.get("PATCHPROOF_ALLOW_UNVERIFIED_TLS_DIAGNOSTIC", "0").strip().lower()
+    return value in {"1", "true", "yes", "on", "enable", "enabled"}
+
+
+# ==============================================================================
+# TLS: standard-library X.509 reader, missing-intermediate repair, diagnostics
+# ==============================================================================
+# Browsers repair a server that omits its intermediate certificate by downloading
+# it from the CA Issuers (AIA) link inside the server certificate. Python's ssl
+# module does not, which is why such sites fail with "unable to get local issuer
+# certificate" (OpenSSL verify code 20). Everything here uses only the standard
+# library, so no extra package is required.
+#
+# Security rules that never change:
+#   * Verification and hostname checks stay on for every connection.
+#   * AIA URLs come from an unauthenticated certificate, so they go through the
+#     SSRF-safe fetcher (public addresses only, DNS pinning, size/time/redirect caps).
+#   * Downloaded self-signed certificates are discarded (they could become roots).
+#   * Partial-chain trust is switched off, so an intermediate can never act as a root.
+
+from datetime import datetime as _DateTime, timezone as _UTC
+
+MAX_AIA_CERT_BYTES = 64 * 1024
+MAX_AIA_CHAIN_DEPTH = 3
+MAX_AIA_DOWNLOADS = 3
+MIN_RSA_BITS = 2048
+MAX_PUBLIC_CERT_DAYS = 398
+INDIA_ISSUER_STEP = ("The issuer is an Indian certificate authority. Government and public-sector certificates often chain "
+                     "to national roots that are not in default public trust stores. Obtain that CA's root certificate from "
+                     "the issuer and set PATCHPROOF_CA_BUNDLE to it, or install it in the Windows Trusted Root store.")
+_INSPECTION_VENDORS = ("zscaler", "fortinet", "fortigate", "netskope", "palo alto", "bluecoat", "blue coat", "sophos",
+                       "forcepoint", "websense", "smoothwall", "untangle", "cisco umbrella", "check point", "kaspersky",
+                       "bitdefender", "mcafee", "avast", "symantec", "barracuda", "cyberoam")
+
+
+class _DERError(ValueError):
+    """Malformed or unsupported DER data."""
+
+
+class TLSVerificationBlocked(ValueError):
+    """Certificate verification failed. ``diagnostics`` holds the structured TLS report."""
+
+    def __init__(self, message, diagnostics=None):
+        super().__init__(message)
+        self.diagnostics = diagnostics or {}
+
+
+def _der_tlvs(data):
+    """Split a DER buffer into (tag, value, raw) triples."""
+    out = []
+    pos = 0
+    total = len(data)
+    while pos < total:
+        start = pos
+        if pos + 2 > total:
+            raise _DERError("truncated DER header")
+        tag = data[pos]
+        if tag & 0x1F == 0x1F:
+            raise _DERError("unsupported high-tag-number form")
+        length = data[pos + 1]
+        pos += 2
+        if length & 0x80:
+            count = length & 0x7F
+            if count == 0 or count > 4 or pos + count > total:
+                raise _DERError("invalid DER length")
+            length = int.from_bytes(data[pos:pos + count], "big")
+            pos += count
+        if pos + length > total:
+            raise _DERError("DER length exceeds buffer")
+        out.append((tag, data[pos:pos + length], data[start:pos + length]))
+        pos += length
+    return out
+
+
+def _der_tlv(tag, content):
+    length = len(content)
+    if length < 0x80:
+        head = bytes([tag, length])
+    else:
+        size = (length.bit_length() + 7) // 8
+        head = bytes([tag, 0x80 | size]) + length.to_bytes(size, "big")
+    return head + content
+
+
+def _oid(dotted):
+    parts = [int(p) for p in dotted.split(".")]
+    body = bytearray([40 * parts[0] + parts[1]])
+    for value in parts[2:]:
+        chunk = [value & 0x7F]
+        value >>= 7
+        while value:
+            chunk.append(0x80 | (value & 0x7F))
+            value >>= 7
+        body.extend(reversed(chunk))
+    return bytes(body)
+
+
+_OID_CN = _oid("2.5.4.3")
+_OID_O = _oid("2.5.4.10")
+_OID_C = _oid("2.5.4.6")
+_OID_SAN = _oid("2.5.29.17")
+_OID_AIA = _oid("1.3.6.1.5.5.7.1.1")
+_OID_CA_ISSUERS = _oid("1.3.6.1.5.5.7.48.2")
+_OID_RSA = _oid("1.2.840.113549.1.1.1")
+_OID_EC = _oid("1.2.840.10045.2.1")
+_SIGNATURE_NAMES = {
+    _oid("1.2.840.113549.1.1.4"): "md5WithRSAEncryption",
+    _oid("1.2.840.113549.1.1.5"): "sha1WithRSAEncryption",
+    _oid("1.2.840.10045.4.1"): "ecdsa-with-SHA1",
+    _oid("1.2.840.10040.4.3"): "dsa-with-SHA1",
+    _oid("1.2.840.113549.1.1.11"): "sha256WithRSAEncryption",
+    _oid("1.2.840.113549.1.1.12"): "sha384WithRSAEncryption",
+    _oid("1.2.840.113549.1.1.13"): "sha512WithRSAEncryption",
+    _oid("1.2.840.10045.4.3.2"): "ecdsa-with-SHA256",
+    _oid("1.2.840.10045.4.3.3"): "ecdsa-with-SHA384",
+}
+_WEAK_SIGNATURE_OIDS = {
+    _oid("1.2.840.113549.1.1.4"), _oid("1.2.840.113549.1.1.5"),
+    _oid("1.2.840.10045.4.1"), _oid("1.2.840.10040.4.3"),
+}
+
+
+def _der_string(tag, value):
+    if tag == 0x1E:
+        return value.decode("utf-16-be", "replace")
+    if tag in {0x0C, 0x13, 0x16}:
+        return value.decode("utf-8", "replace")
+    return value.decode("latin-1")
+
+
+def _der_name_attrs(name_value):
+    attrs = {}
+    for rdn_tag, rdn_value, _ in _der_tlvs(name_value):
+        if rdn_tag != 0x31:
+            continue
+        for _, atav_value, _ in _der_tlvs(rdn_value):
+            pair = _der_tlvs(atav_value)
+            if len(pair) == 2:
+                attrs.setdefault(pair[0][1], _der_string(pair[1][0], pair[1][1]))
+    return attrs
+
+
+def _name_text(attrs):
+    parts = []
+    for label, oid in (("CN", _OID_CN), ("O", _OID_O), ("C", _OID_C)):
+        if oid in attrs:
+            parts.append(f"{label}={attrs[oid]}")
+    return ", ".join(parts) or "(no name)"
+
+
+def _der_time(tag, value):
+    text = value.decode("ascii", "replace").rstrip("Z").split(".")[0]
+    if tag == 0x17:  # UTCTime: two-digit year per RFC 5280
+        yy = int(text[:2])
+        text = f"{2000 + yy if yy < 50 else 1900 + yy}{text[2:]}"
+    try:
+        return _DateTime.strptime(text, "%Y%m%d%H%M%S").replace(tzinfo=_UTC.utc)
+    except ValueError as exc:
+        raise _DERError("invalid certificate time") from exc
+
+
+def _parse_x509_fields(der):
+    top = _der_tlvs(der)
+    if len(top) != 1 or top[0][0] != 0x30:
+        raise _DERError("not a DER certificate")
+    cert = _der_tlvs(top[0][1])
+    if len(cert) < 3 or cert[0][0] != 0x30:
+        raise _DERError("malformed certificate")
+    fields = _der_tlvs(cert[0][1])
+    if fields and fields[0][0] == 0xA0:  # [0] version
+        fields = fields[1:]
+    if len(fields) < 6:
+        raise _DERError("malformed TBS certificate")
+    issuer_value, issuer_raw = fields[2][1], fields[2][2]
+    subject_value, subject_raw = fields[4][1], fields[4][2]
+    validity = _der_tlvs(fields[3][1])
+    spki = _der_tlvs(fields[5][1])
+    if len(validity) != 2 or len(spki) != 2:
+        raise _DERError("malformed validity or key")
+    not_before = _der_time(validity[0][0], validity[0][1])
+    not_after = _der_time(validity[1][0], validity[1][1])
+    sig_oid = _der_tlvs(cert[1][1])[0][1]
+    key_oid = _der_tlvs(spki[0][1])[0][1]
+    key_bits = None
+    if key_oid == _OID_RSA:
+        rsa_key = _der_tlvs(_der_tlvs(spki[1][1][1:])[0][1])
+        key_bits = len(rsa_key[0][1].lstrip(b"\x00")) * 8
+        key_label = f"RSA {key_bits}"
+    elif key_oid == _OID_EC:
+        key_label = "EC"
+    else:
+        key_label = "other"
+    dns_names, aia_urls = [], []
+    for tag, ext_container, _ in fields[6:]:
+        if tag != 0xA3:
+            continue
+        for _, ext_value, _ in _der_tlvs(_der_tlvs(ext_container)[0][1]):
+            parts = _der_tlvs(ext_value)
+            if len(parts) < 2 or parts[-1][0] != 0x04:
+                continue
+            ext_oid, octets = parts[0][1], parts[-1][1]
+            if ext_oid == _OID_SAN:
+                for gtag, gvalue, _ in _der_tlvs(_der_tlvs(octets)[0][1]):
+                    if gtag == 0x82:
+                        dns_names.append(gvalue.decode("ascii", "replace"))
+            elif ext_oid == _OID_AIA:
+                for _, desc_value, _ in _der_tlvs(_der_tlvs(octets)[0][1]):
+                    desc = _der_tlvs(desc_value)
+                    if len(desc) == 2 and desc[0][1] == _OID_CA_ISSUERS and desc[1][0] == 0x86:
+                        aia_urls.append(desc[1][1].decode("ascii", "replace"))
+    issuer_attrs = _der_name_attrs(issuer_value)
+    return {
+        "subject": _name_text(_der_name_attrs(subject_value)),
+        "issuer": _name_text(issuer_attrs),
+        "issuer_country": issuer_attrs.get(_OID_C, ""),
+        "subject_raw": subject_raw,
+        "issuer_raw": issuer_raw,
+        "self_signed": subject_raw == issuer_raw,
+        "not_before": not_before,
+        "not_after": not_after,
+        "signature": _SIGNATURE_NAMES.get(sig_oid, "unrecognized signature algorithm"),
+        "weak_signature": sig_oid in _WEAK_SIGNATURE_OIDS,
+        "key": key_label,
+        "key_bits": key_bits,
+        "dns_names": dns_names,
+        "aia_ca_issuers": aia_urls,
+        "der": der,
+    }
+
+
+def _parse_x509(der):
+    """Parse one DER certificate. Malformed input raises _DERError (a ValueError)."""
+    try:
+        return _parse_x509_fields(der)
+    except (IndexError, KeyError, TypeError, StopIteration) as exc:
+        raise _DERError(f"malformed certificate: {exc}") from exc
+
+
+def _assess_certificate(info, now=None):
+    """Return (blocking_problems, warnings) under PatchProof's certificate policy."""
+    now = now or _DateTime.now(_UTC.utc)
+    problems, warnings = [], []
+    if info["weak_signature"]:
+        problems.append(f"weak signature algorithm ({info['signature']}); SHA-1 and MD5 certificates are rejected")
+    if info["key_bits"] is not None and info["key_bits"] < MIN_RSA_BITS:
+        problems.append(f"RSA key is {info['key_bits']} bits; the minimum is {MIN_RSA_BITS}")
+    if info["not_before"] > now:
+        problems.append("certificate is not yet valid")
+    if info["not_after"] < now:
+        problems.append("certificate has expired")
+    days_left = (info["not_after"] - now).days
+    if 0 <= days_left < 14:
+        warnings.append(f"certificate expires in {days_left} day(s)")
+    lifetime = (info["not_after"] - info["not_before"]).days
+    if lifetime > MAX_PUBLIC_CERT_DAYS:
+        warnings.append(f"certificate lifetime is {lifetime} days; public CAs may issue at most {MAX_PUBLIC_CERT_DAYS}")
+    return problems, warnings
+
+
+def _leaf_summary(info, now=None):
+    now = now or _DateTime.now(_UTC.utc)
+    problems, warnings = _assess_certificate(info, now)
+    return {
+        "subject": info["subject"],
+        "issuer": info["issuer"],
+        "issuer_country": info["issuer_country"],
+        "not_before": info["not_before"].isoformat(),
+        "not_after": info["not_after"].isoformat(),
+        "days_left": (info["not_after"] - now).days,
+        "signature": info["signature"],
+        "key": info["key"],
+        "dns_names": list(info["dns_names"])[:12],
+        "aia_ca_issuers": list(info["aia_ca_issuers"])[:3],
+        "self_signed": info["self_signed"],
+        "problems": problems,
+        "warnings": warnings,
+    }
+
+
+def _hostname_matches(host, names):
+    host = host.lower().rstrip(".")
+    for name in names:
+        pattern = name.lower().rstrip(".")
+        if pattern == host:
+            return True
+        if pattern.startswith("*.") and host.endswith(pattern[1:]) and host.count(".") == pattern.count("."):
+            return True
+    return False
+
+
+def _verify_code(error):
+    code = getattr(error, "verify_code", None)
+    if code is None and isinstance(error, ssl.SSLCertVerificationError):
+        code = getattr(error, "errno", None)
+    return code
+
+
+def _verify_message(error):
+    text = getattr(error, "verify_message", "") or str(error)
+    return re.sub(r"^\[Errno -?\d+\]\s*", "", text).strip()
+
+
+def _chain_repair_may_help(error):
+    """True for 'issuer not found' failures; False for expiry, hostname and self-signed problems."""
+    if _verify_code(error) in {9, 10, 18, 19, 62}:
+        return False
+    message = _verify_message(error).lower()
+    return not any(token in message for token in ("hostname", "expired", "not yet valid", "self-signed", "self signed"))
+
+
+def _fetch_peer_leaf_der(parsed, address, timeout=5):
+    """Read the presented leaf certificate. No HTTP request is sent on this connection."""
+    port = parsed.port or 443
+    host = parsed.hostname.encode("idna").decode("ascii")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    try:
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+    except (AttributeError, ValueError):
+        pass
+    raw_socket = None
+    try:
+        raw_socket = socket.create_connection((address, port), timeout)
+        with context.wrap_socket(raw_socket, server_hostname=host) as tls_socket:
+            return tls_socket.getpeercert(binary_form=True)
+    except (OSError, ssl.SSLError, ValueError, UnicodeError):
+        return None
+    finally:
+        if raw_socket is not None:
+            try:
+                raw_socket.close()
+            except OSError:
+                pass
+
+
+def _pkcs7_certificates(body):
+    """Extract certificates from a PKCS#7 (.p7c) CA Issuers payload."""
+    try:
+        content_info = _der_tlvs(body)[0][1]
+        items = _der_tlvs(content_info)
+        explicit = next(value for tag, value, _ in items if tag == 0xA0)
+        signed_fields = _der_tlvs(_der_tlvs(explicit)[0][1])
+        certs_field = next(value for tag, value, _ in signed_fields if tag == 0xA0)
+        return [raw for tag, _, raw in _der_tlvs(certs_field) if tag == 0x30]
+    except (IndexError, StopIteration, ValueError):
+        return []
+
+
+def _certs_from_aia_response(body):
+    """Parse PEM, DER or PKCS#7 issuer data. Self-signed certificates are never returned."""
+    if len(body) > MAX_AIA_CERT_BYTES:
+        return []
+    if b"-----BEGIN CERTIFICATE-----" in body:
+        ders = []
+        for match in re.finditer(rb"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----", body, re.S):
+            try:
+                ders.append(ssl.PEM_cert_to_DER_cert(match.group(0).decode("ascii", "replace")))
+            except ValueError:
+                continue
+    else:
+        try:
+            _parse_x509(body)
+            ders = [body]
+        except ValueError:
+            ders = _pkcs7_certificates(body)
+    kept = []
+    for der in ders[:4]:
+        try:
+            info = _parse_x509(der)
+        except ValueError:
+            continue
+        if info["self_signed"]:
+            continue  # a downloaded self-signed certificate must never become a trust anchor
+        kept.append(der)
+    return kept
+
+
+def _download_aia_certificates(url, timeout=6):
+    """Download an issuer certificate from a CA Issuers URL through the SSRF-safe fetcher."""
+    current = url
+    for _ in range(3):
+        try:
+            validated = safe_public_url(current)
+            parsed = urlparse(validated)
+            addresses = _resolve_public_addresses(parsed)
+        except ValueError:
+            return []
+        result = None
+        for address in list(addresses)[:3]:
+            try:
+                result = _request_public_once(
+                    parsed, address, timeout=timeout,
+                    accept="application/pkix-cert, application/x-x509-ca-cert, application/pkcs7-mime, */*",
+                )
+                break
+            except (OSError, ssl.SSLError, TimeoutError, HTTPException, ValueError):
+                continue
+        if result is None:
+            return []
+        status, body, headers = result
+        if status in {301, 302, 303, 307, 308}:
+            location = next((v for k, v in headers.items() if k.lower() == "location"), None)
             if not location:
-                raise ValueError("Redirect header missing destination location.")
-            current = safe_public_url(urljoin(current, location))
+                return []
+            current = urljoin(validated, location)
+            continue
+        if status != 200 or not body:
+            return []
+        return _certs_from_aia_response(body)
+    return []
+
+
+def _repair_missing_intermediates(parsed, addresses):
+    """Follow CA Issuers links from the presented leaf, the way browsers do.
+
+    Returns a report. report["pem"] is non-empty only when intermediates were found.
+    """
+    report = {"pem": "", "leaf": None, "downloads": [], "reason": "", "source_url": "",
+              "top_issuer": "", "top_issuer_country": ""}
+    leaf_der = None
+    for address in list(addresses)[:3]:
+        leaf_der = _fetch_peer_leaf_der(parsed, address)
+        if leaf_der:
+            break
+    if not leaf_der:
+        report["reason"] = "no_leaf"
+        return report
+    try:
+        current = _parse_x509(leaf_der)
+    except ValueError:
+        report["reason"] = "unparseable_leaf"
+        return report
+    report["leaf"] = current
+    report["reason"] = "no_aia" if not current["aia_ca_issuers"] else "aia_unreachable"
+    pems = []
+    for _ in range(MAX_AIA_CHAIN_DEPTH):
+        if current["self_signed"] or not current["aia_ca_issuers"]:
+            break
+        found, used_url = [], ""
+        for url in current["aia_ca_issuers"][:MAX_AIA_DOWNLOADS]:
+            certificates = _download_aia_certificates(url)
+            report["downloads"].append({"url": url[:300], "certificates": len(certificates)})
+            if certificates:
+                found, used_url = certificates, url
+                break
+        if not found:
+            break
+        match = next((der for der in found if _parse_x509(der)["subject_raw"] == current["issuer_raw"]), found[0])
+        pems.append(ssl.DER_cert_to_PEM_cert(match))
+        current = _parse_x509(match)
+        report["source_url"] = report["source_url"] or used_url
+        report["reason"] = "downloaded"
+    if pems:
+        report["pem"] = "".join(pems)
+    report["top_issuer"] = current["issuer"]
+    report["top_issuer_country"] = current["issuer_country"]
+    return report
+
+
+def _verified_context_with_intermediates(pem_text):
+    """Fully verified context: normal trust plus the downloaded intermediates. Never relaxes checks."""
+    context = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
+    context.load_verify_locations(cafile=certifi.where())
+    custom_bundle = os.environ.get("PATCHPROOF_CA_BUNDLE", "").strip()
+    if custom_bundle:
+        bundle_path = Path(custom_bundle).expanduser()
+        if not bundle_path.is_file():
+            raise FileNotFoundError(f"PATCHPROOF_CA_BUNDLE does not exist: {bundle_path}")
+        context.load_verify_locations(cafile=str(bundle_path))
+    context.load_verify_locations(cadata=pem_text)
+    if hasattr(ssl, "VERIFY_X509_PARTIAL_CHAIN"):
+        # Python 3.13+ enables partial-chain trust by default. Turn it off so a
+        # downloaded intermediate can never act as a trust anchor.
+        context.verify_flags &= ~ssl.VERIFY_X509_PARTIAL_CHAIN
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.check_hostname = True
+    try:
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+    except (AttributeError, ValueError):
+        pass
+    context._patchproof_tls_backend = "python-system+certifi+aia-intermediates"
+    return context
+
+
+def _classify_tls_failure(report):
+    """Return (cause_code, plain_explanation, next_steps) for a failed verification."""
+    code = report.get("verify_code")
+    message = (report.get("verify_message") or "").lower()
+    leaf = report.get("leaf") or {}
+    host = report.get("host") or "the website"
+    names = leaf.get("dns_names") or []
+    issuer = report.get("top_issuer") or leaf.get("issuer") or "an unknown issuer"
+    indian = (report.get("top_issuer_country") or leaf.get("issuer_country") or "").upper() == "IN"
+    india_steps = [INDIA_ISSUER_STEP] if indian else []
+
+    if report.get("inspection_vendor"):
+        vendor = report["inspection_vendor"].title()
+        return ("tls_inspection",
+                f"The certificate was issued by {vendor}, a network HTTPS-inspection product, not by the website's own certificate authority.",
+                ["If your organization runs this inspection proxy, install its root certificate on this machine and set PATCHPROOF_CA_BUNDLE to that root file.",
+                 "Or run the scan from a network without HTTPS inspection, such as a phone hotspot."])
+    if code == 10 or "expired" in message:
+        return ("expired",
+                f"The server certificate expired on {(leaf.get('not_after') or '')[:10] or 'an earlier date'}.",
+                ["Ask the site owner to renew and install the certificate. No PatchProof setting can make an expired certificate trusted."])
+    if code == 9 or "not yet valid" in message:
+        return ("not_yet_valid",
+                f"The server certificate is not valid until {(leaf.get('not_before') or '')[:10] or 'a later date'}.",
+                ["Check this computer's date and time first. If the clock is correct, the site owner must correct the certificate dates."])
+    if code == 62 or "hostname" in message:
+        covered = ", ".join(names[:6]) or "no DNS names"
+        return ("hostname_mismatch",
+                f"The certificate does not cover {host}. It covers: {covered}.",
+                [f"Use a hostname the certificate covers (for example with or without www), or ask the site owner to fix the certificate for {host}."])
+    if code in {18, 19} or "self signed" in message or "self-signed" in message:
+        return ("self_signed",
+                "The server presents a self-signed certificate, or a self-signed root that this machine does not trust.",
+                ["Trust it only if your organization operates this server. Then install its root certificate on this machine and set PATCHPROOF_CA_BUNDLE to that file."] + india_steps)
+
+    repair_reason = report.get("repair_reason", "")
+    if repair_reason == "downloaded":
+        return ("root_not_trusted",
+                f"The chain is complete up to {issuer}, but this machine does not trust that root certificate authority.",
+                ["If your organization or a government body issued this root, install its root certificate and set PATCHPROOF_CA_BUNDLE to that file. Only add a root you can verify.",
+                 "Certificates from public CAs need no change on this machine, so a private or national root means the site uses a non-public CA."] + india_steps)
+    if repair_reason == "aia_unreachable":
+        return ("aia_unreachable",
+                f"The server did not send its intermediate certificate, and PatchProof could not download it from the CA Issuers link for {issuer}.",
+                ["Ask the site owner to install the full chain (the server certificate plus every intermediate) on the web server or CDN. This fixes the problem for every client, not only PatchProof.",
+                 "On a managed network, check that the CA Issuers host is not blocked by a firewall or proxy."])
+    if repair_reason == "no_aia":
+        return ("missing_intermediate",
+                f"The certificate was issued by {issuer}, which this machine cannot find, and the certificate has no CA Issuers link to fetch it.",
+                ["Ask the site owner to install the full chain (the server certificate plus every intermediate) on the web server or CDN. Browsers hide this fault; curl, Python and most API clients do not.",
+                 "If the site already sends its full chain, the issuer's root is missing from this machine. Install that root and set PATCHPROOF_CA_BUNDLE to it."] + india_steps)
+    extra = (" PatchProof could not read the server certificate on a second connection, so the chain could not be followed. "
+             "Network inspection or a firewall may be interfering.") if repair_reason in {"no_leaf", "unparseable_leaf"} else ""
+    return ("unknown_chain",
+            f"The certificate chain could not be completed to a trusted root. Issuer: {issuer}.{extra}",
+            [f"Run: openssl s_client -connect {host}:443 -servername {host} -showcerts  and check that every certificate in the output appears in the chain.",
+             "Confirm that the issuer's root is installed on this machine, or set PATCHPROOF_CA_BUNDLE to the organization-approved root."] + india_steps)
+
+
+def _tls_failure_report(parsed, error, repair=None, addresses=(), final_error=None):
+    """Structured, JSON-safe report for a certificate verification failure."""
+    repair = repair or {}
+    host = parsed.hostname or ""
+    leaf = repair.get("leaf")
+    if leaf is None and parsed.scheme.lower() == "https" and addresses:
+        leaf_der = _fetch_peer_leaf_der(parsed, list(addresses)[0])
+        if leaf_der:
+            try:
+                leaf = _parse_x509(leaf_der)
+            except ValueError:
+                leaf = None
+    report = {
+        "host": host,
+        "url": f"{parsed.scheme}://{parsed.netloc}{parsed.path or '/'}"[:300],
+        "verify_code": _verify_code(error),
+        "verify_message": _verify_message(error)[:300],
+        "leaf": _leaf_summary(leaf) if leaf else None,
+        "aia_downloads": repair.get("downloads", []),
+        "repair_reason": repair.get("reason", ""),
+        "top_issuer": repair.get("top_issuer") or (leaf["issuer"] if leaf else ""),
+        "top_issuer_country": repair.get("top_issuer_country") or (leaf["issuer_country"] if leaf else ""),
+        "source_url": repair.get("source_url", ""),
+    }
+    if final_error is not None and final_error is not error:
+        report["final_verify_code"] = _verify_code(final_error)
+        report["final_verify_message"] = _verify_message(final_error)[:300]
+    haystack = f"{report['top_issuer']} {leaf['issuer'] if leaf else ''}".lower()
+    report["inspection_vendor"] = next((v for v in _INSPECTION_VENDORS if v in haystack), "")
+    cause, explanation, steps = _classify_tls_failure(report)
+    report.update({"cause": cause, "explanation": explanation, "steps": steps})
+    return report
+
+
+def _policy_failure_report(parsed, leaf_info, problems):
+    """Report for a certificate that verifies but fails PatchProof's strength policy."""
+    return {
+        "host": parsed.hostname or "",
+        "url": f"{parsed.scheme}://{parsed.netloc}{parsed.path or '/'}"[:300],
+        "verify_code": None,
+        "verify_message": "; ".join(problems)[:300],
+        "leaf": _leaf_summary(leaf_info),
+        "aia_downloads": [],
+        "repair_reason": "",
+        "top_issuer": leaf_info["issuer"],
+        "top_issuer_country": leaf_info["issuer_country"],
+        "source_url": "",
+        "inspection_vendor": "",
+        "cause": "weak_certificate",
+        "explanation": "PatchProof's certificate policy rejects this certificate: " + "; ".join(problems) + ".",
+        "steps": ["Ask the site owner to replace the certificate with one signed using SHA-256 or stronger and an RSA key of at least 2048 bits, or an ECDSA key."],
+    }
+
+
+def _tls_failure_message(report):
+    code = report.get("verify_code")
+    detail = report.get("verify_message") or "the certificate could not be verified"
+    code_text = f" (verification code {code}: {detail})" if code is not None else f" ({detail})"
+    next_step = report["steps"][0] if report.get("steps") else ""
+    return (f"TLS certificate verification failed for {report.get('host', '')}{code_text}. "
+            f"{report.get('explanation', '')} Next step: {next_step} "
+            "Certificate and hostname verification remain enabled; PatchProof will not disable "
+            "TLS verification or silently downgrade to HTTP. Full details are in the TLS diagnostic report.")
+
+
+def _days_text(days):
+    if days is None:
+        return ""
+    return f"{days} day(s) left" if days >= 0 else f"expired {-days} day(s) ago"
+
+
+def format_tls_diagnostics(report):
+    """Human-readable TLS report used by the command line and shown in the UI."""
+    leaf = report.get("leaf") or {}
+    code = report.get("verify_code")
+    code_text = f"code {code} - " if code is not None else ""
+    lines = [
+        "TLS CHECK - " + str(report.get("host", "")),
+        "=" * 66,
+        "Result       : BLOCKED (certificate not trusted; no HTTP fallback)",
+        f"Verification : {code_text}{report.get('verify_message', '')}",
+        f"Cause        : {report.get('explanation', '')}",
+    ]
+    if report.get("final_verify_code") is not None:
+        lines.append(f"After repair : code {report['final_verify_code']} - {report.get('final_verify_message', '')}")
+    if leaf:
+        covers = ", ".join(leaf.get("dns_names", [])) or "(no DNS names)"
+        cdp = ", ".join(leaf.get("aia_ca_issuers", [])) or "(none in certificate)"
+        lines += [
+            f"Certificate  : {leaf.get('subject', '')}",
+            f"Issued by    : {leaf.get('issuer', '')}",
+            f"Valid        : {leaf.get('not_before', '')[:10]} to {leaf.get('not_after', '')[:10]} ({_days_text(leaf.get('days_left'))})",
+            f"Algorithms   : {leaf.get('signature', '')}; key {leaf.get('key', '')}",
+            f"Covers       : {covers}",
+            f"CA Issuers   : {cdp}",
+        ]
+    for download in report.get("aia_downloads", []):
+        lines.append(f"Fetched      : {download['url']} -> {download['certificates']} certificate(s)")
+    if report.get("top_issuer") and report.get("cause") not in {"hostname_mismatch", "expired", "not_yet_valid"}:
+        lines.append(f"Top issuer   : {report['top_issuer']}")
+    lines += ["", "What to do:"]
+    lines += [f"  {number}. {step}" for number, step in enumerate(report.get("steps", []), 1)]
+    lines += ["", "Verification was NOT disabled. PatchProof does not accept untrusted certificates."]
+    return "\n".join(lines)
+
+
+
+
+def _request_public_once(parsed, address, accept="*/*", timeout=12, tls_context=None, peer_sink=None):
+    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    host = parsed.hostname.encode("idna").decode("ascii")
+    default_port = 443 if parsed.scheme.lower() == "https" else 80
+    host_header = f"[{host}]" if ":" in host else host
+    if port != default_port:
+        host_header += f":{port}"
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+
+    if parsed.scheme.lower() == "https":
+        context = tls_context or build_public_tls_context()
+        connection = _PinnedHTTPSConnection(host, address, port, context, timeout)
+    else:
+        connection = _PinnedHTTPConnection(host, address, port, timeout)
+
+    try:
+        connection.request("GET", path, headers={
+            "Host": host_header,
+            "User-Agent": os.environ.get(
+                "PATCHPROOF_USER_AGENT",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 PatchProof/8.0",
+            ),
+            "Accept": accept,
+            "Accept-Language": "en-US,en;q=0.9,*;q=0.5",
+            "Accept-Encoding": "gzip, deflate",
+            "Connection": "close",
+        })
+        if peer_sink is not None and isinstance(connection, HTTPSConnection) and connection.sock is not None:
+            try:
+                peer_der = connection.sock.getpeercert(binary_form=True)
+            except (OSError, ValueError):
+                peer_der = None
+            if peer_der:
+                peer_sink.append(peer_der)
+        response = connection.getresponse()
+        body = response.read(MAX_REMOTE_BYTES + 1)
+        if len(body) > MAX_REMOTE_BYTES:
+            raise ValueError("Compressed remote response exceeds the inspection size limit.")
+        response_headers = dict(response.getheaders())
+        encoding = next((v for k, v in response_headers.items() if k.lower() == "content-encoding"), "").lower().strip()
+        if encoding in {"gzip", "deflate"} and body:
+            window_bits = zlib.MAX_WBITS | 16 if encoding == "gzip" else zlib.MAX_WBITS
+            decoder = zlib.decompressobj(window_bits)
+            decoded = decoder.decompress(body, MAX_REMOTE_BYTES + 1)
+            if len(decoded) > MAX_REMOTE_BYTES or decoder.unconsumed_tail:
+                raise ValueError("Decompressed remote response exceeds the inspection size limit.")
+            remaining = MAX_REMOTE_BYTES + 1 - len(decoded)
+            if remaining > 0:
+                decoded += decoder.flush(remaining)
+            if len(decoded) > MAX_REMOTE_BYTES:
+                raise ValueError("Decompressed remote response exceeds the inspection size limit.")
+            if not decoder.eof:
+                raise ValueError("The website returned a truncated or malformed compressed response.")
+            body = decoded
+        elif encoding and encoding not in {"identity"}:
+            raise ValueError(f"Unsupported remote Content-Encoding: {encoding}.")
+        return response.status, body, response_headers
+    finally:
+        connection.close()
+
+
+def fetch_public(url, accept="*/*", *, allow_unverified_tls=False):
+    """Fetch a public URL with DNS pinning, bounded redirects and strict TLS.
+
+    1. Normal verification (native truststore when installed, otherwise system + certifi).
+    2. If the only failure is a missing issuer, follow the certificate's CA Issuers links,
+       then retry with full verification and hostname checking still enforced.
+    3. A certificate that verifies but fails PatchProof's strength policy is refused.
+    4. Only if the operator opts in and the caller allows it: an anonymous passive GET
+       without peer authentication, always marked TLS-UNVERIFIED.
+    """
+    current = safe_public_url(url)
+    visited = set()
+    tls_chain_verified = True
+    first_tls_warning = ""
+    for redirect_count in range(6):
+        parsed = urlparse(current)
+        normalized = (parsed.scheme.lower(), (parsed.hostname or "").lower(), parsed.port,
+                      parsed.path or "/", parsed.query)
+        if normalized in visited:
+            raise ValueError("Redirect loop detected while inspecting the website.")
+        visited.add(normalized)
+
+        is_https = parsed.scheme.lower() == "https"
+        addresses = _resolve_public_addresses(parsed)
+        tls_context = build_public_tls_context() if is_https else None
+        last_error = None
+        response_data = None
+        cert_errors = []
+        peer_sink = []
+        repair = None
+        repair_error = None
+        hop_repair_source = ""
+
+        # Pass 1: normal verification on every validated address (CDN / multi-A failover).
+        for address in addresses:
+            try:
+                response_data = _request_public_once(parsed, address, accept=accept, timeout=12,
+                                                     tls_context=tls_context, peer_sink=peer_sink)
+                break
+            except ssl.SSLCertVerificationError as exc:
+                cert_errors.append((address, exc))
+                last_error = exc
+            except (OSError, ssl.SSLError, TimeoutError, HTTPException) as exc:
+                if last_error is None:
+                    last_error = exc
+
+        # Pass 2: repair a missing intermediate, still fully verified.
+        if (response_data is None and is_https and cert_errors
+                and any(_chain_repair_may_help(err) for _, err in cert_errors)):
+            repair = _repair_missing_intermediates(parsed, addresses)
+            if repair.get("pem"):
+                try:
+                    repair_context = _verified_context_with_intermediates(repair["pem"])
+                except (OSError, ssl.SSLError, ValueError):
+                    repair_context = None
+                if repair_context is not None:
+                    for address in addresses:
+                        try:
+                            response_data = _request_public_once(parsed, address, accept=accept, timeout=12,
+                                                                 tls_context=repair_context, peer_sink=peer_sink)
+                            hop_repair_source = repair.get("source_url") or "aia"
+                            break
+                        except ssl.SSLCertVerificationError as exc:
+                            repair_error = exc
+                        except (OSError, ssl.SSLError, TimeoutError, HTTPException) as exc:
+                            last_error = exc
+
+        # Pass 3: passive diagnostics only, opt-in, never used for execution or previews.
+        if (response_data is None and cert_errors and allow_unverified_tls
+                and unverified_tls_diagnostics_enabled() and is_https):
+            diagnostic_context = build_unverified_diagnostic_tls_context()
+            for address, verification_error in cert_errors:
+                try:
+                    response_data = _request_public_once(parsed, address, accept=accept, timeout=12,
+                                                         tls_context=diagnostic_context, peer_sink=peer_sink)
+                    tls_chain_verified = False
+                    if not first_tls_warning:
+                        first_tls_warning = (f"TLS certificate verification failed for {parsed.hostname}: "
+                                             f"{_verify_message(verification_error)}. Diagnostic-only retrieval: "
+                                             "the server identity was NOT authenticated.")
+                    break
+                except (OSError, ssl.SSLError, TimeoutError, HTTPException) as exc:
+                    last_error = exc
+
+        if response_data is None:
+            if cert_errors:
+                cert_error = cert_errors[0][1]
+                report = _tls_failure_report(parsed, cert_error, repair=repair, addresses=addresses,
+                                             final_error=repair_error)
+                raise TLSVerificationBlocked(_tls_failure_message(report), diagnostics=report) from cert_error
+            if isinstance(last_error, ssl.SSLError):
+                raise ValueError(f"TLS handshake failed for {parsed.hostname}: {last_error}") from last_error
+            raise ValueError(
+                f"Could not connect to the public website {parsed.hostname}: "
+                f"{type(last_error).__name__ if last_error else 'connection failed'}: {last_error or ''}"
+            )
+
+        # Certificate strength policy, applied to every verified HTTPS hop.
+        leaf_summary = None
+        if is_https and tls_chain_verified and peer_sink:
+            try:
+                leaf_info = _parse_x509(peer_sink[0])
+            except ValueError:
+                leaf_info = None
+            if leaf_info is not None:
+                problems, _warnings = _assess_certificate(leaf_info)
+                if problems:
+                    report = _policy_failure_report(parsed, leaf_info, problems)
+                    raise TLSVerificationBlocked(_tls_failure_message(report), diagnostics=report)
+                leaf_summary = _leaf_summary(leaf_info)
+
+        status, body, headers = response_data
+        if status in {301, 302, 303, 307, 308}:
+            location = next((v for k, v in headers.items() if k.lower() == "location"), None)
+            if not location:
+                raise ValueError("Redirect response did not include a Location header.")
+            if redirect_count >= 5:
+                raise ValueError("Too many redirects encountered (maximum 6 hops).")
+            next_url = urljoin(current, location)
+            next_parsed = urlparse(next_url)
+            if is_https and next_parsed.scheme.lower() == "http":
+                raise ValueError("HTTPS-to-HTTP redirect blocked: PatchProof will not downgrade a secure inspection.")
+            current = safe_public_url(next_url)
+            continue
+
+        # Metadata is internal to the report; it is stripped from displayed response headers.
+        headers["X-PatchProof-TLS-Verified"] = "true" if tls_chain_verified else "false"
+        headers["X-PatchProof-TLS-Mode"] = "verified" if tls_chain_verified else "diagnostic-unverified"
+        if hop_repair_source:
+            headers["X-PatchProof-TLS-Chain-Repair"] = "aia"
+            headers["X-PatchProof-TLS-Chain-Source"] = hop_repair_source[:300]
+        if leaf_summary:
+            headers["X-PatchProof-TLS-Leaf"] = json.dumps(leaf_summary, separators=(",", ":"))
+        if first_tls_warning:
+            headers["X-PatchProof-TLS-Warning"] = first_tls_warning
+        headers["X-PatchProof-Origin-Status"] = str(status)
+        return body, headers, current
+
     raise ValueError("Too many redirects encountered.")
+
+
+def tls_check_cli(url):
+    """Command-line TLS check: python PatchProof.py --tls-check https://site.example"""
+    try:
+        _body, headers, final_url = fetch_public(url, "text/html,application/xhtml+xml")
+    except TLSVerificationBlocked as exc:
+        print(format_tls_diagnostics(exc.diagnostics))
+        return 1
+    except ValueError as exc:
+        print(f"Could not complete the check: {exc}")
+        return 2
+    host = urlparse(final_url).hostname or ""
+    if urlparse(final_url).scheme.lower() != "https":
+        print(f"TLS CHECK - {host}\n{'=' * 66}\nPlain HTTP: no certificate to check.")
+        return 0
+    leaf_raw = next((v for k, v in headers.items() if k.lower() == "x-patchproof-tls-leaf"), "{}")
+    leaf = json.loads(leaf_raw or "{}")
+    repaired = any(k.lower() == "x-patchproof-tls-chain-repair" for k in headers)
+    lines = [
+        f"TLS CHECK - {host}", "=" * 66,
+        "Result       : TRUSTED - verified HTTPS (certificate and hostname checked)",
+        f"Certificate  : {leaf.get('subject', '')}",
+        f"Issued by    : {leaf.get('issuer', '')}",
+        f"Valid        : {leaf.get('not_before', '')[:10]} to {leaf.get('not_after', '')[:10]} ({_days_text(leaf.get('days_left'))})",
+        f"Algorithms   : {leaf.get('signature', '')}; key {leaf.get('key', '')}",
+    ]
+    if repaired:
+        lines.append("Chain        : server omitted its intermediate; PatchProof fetched it from the CA Issuers link.")
+        lines.append("               Browsers handle this silently, but curl, Python and many APIs fail without it.")
+    for warning in leaf.get("warnings", []):
+        lines.append(f"Warning      : {warning}")
+    print("\n".join(lines))
+    return 0
+
 
 
 class PageFacts(HTMLParser):
@@ -1538,6 +2593,31 @@ def launch_chromium(playwright):
     return playwright.chromium.launch(**options)
 
 
+def guard_browser_context(context, request_budget=None):
+    """Block browser navigations/resources that could reach private or non-HTTP targets."""
+    budget = request_budget if request_budget is not None else {"count": 0}
+
+    def validate_request(route):
+        budget["count"] += 1
+        if budget["count"] > MAX_BROWSER_REQUESTS:
+            route.abort()
+            return
+        target = route.request.url
+        scheme = urlparse(target).scheme.lower()
+        if scheme in {"data", "blob", "about"}:
+            route.continue_()
+            return
+        try:
+            safe_public_url(target)
+        except (TypeError, ValueError):
+            route.abort()
+            return
+        route.continue_()
+
+    context.route("**/*", validate_request)
+    return budget
+
+
 def run_browser_audit(url):
     try:
         from playwright.sync_api import sync_playwright
@@ -1545,6 +2625,7 @@ def run_browser_audit(url):
         return {"available": False, "message": "Playwright is not installed. Static analysis used.", "checks": []}, []
 
     checks, runtime_errors, failed_requests, http_errors = [], [], [], []
+    request_budget = {"count": 0}
     try:
         with sync_playwright() as playwright:
             browser = launch_chromium(playwright)
@@ -1554,7 +2635,12 @@ def run_browser_audit(url):
                     {"name": "Mobile landscape", "width": 844, "height": 390},
                     {"name": "Desktop", "width": 1440, "height": 900},
                 ]:
-                    context = browser.new_context(viewport={"width": viewport["width"], "height": viewport["height"]}, device_scale_factor=1)
+                    context = browser.new_context(
+                        viewport={"width": viewport["width"], "height": viewport["height"]},
+                        device_scale_factor=1,
+                        service_workers="block",
+                    )
+                    guard_browser_context(context, request_budget)
                     page = context.new_page()
                     page.set_default_navigation_timeout(14000)
                     page.set_default_timeout(6000)
@@ -1671,17 +2757,87 @@ def simulate_website_header_fixes(headers, fix_types):
 def inspect_url(raw_url, *, _fetcher=None, _browser_audit=None, _allow_private_for_test=False):
     """Inspect a public origin. Private-target bypass exists only for internal fixture tests."""
     url = raw_url if _allow_private_for_test else safe_public_url(raw_url)
-    fetcher = _fetcher or fetch_public
-    body, headers, final_url = fetcher(url, "text/html,application/xhtml+xml")
+    if _fetcher is None:
+        body, headers, final_url = fetch_public(
+            url, "text/html,application/xhtml+xml", allow_unverified_tls=True
+        )
+    else:
+        # Injected fetchers are used by deterministic tests and retain their
+        # existing two-argument contract.
+        body, headers, final_url = _fetcher(url, "text/html,application/xhtml+xml")
     content_type = next((v for k, v in headers.items() if k.lower() == "content-type"), "")
-    html = body.decode("utf-8", errors="replace")
+    charset_match = re.search(r"charset\s*=\s*['\"]?([\w.-]+)", content_type, re.I)
+    charset = charset_match.group(1) if charset_match else "utf-8"
+    try:
+        html = body.decode(charset, errors="replace")
+    except (LookupError, UnicodeError):
+        html = body.decode("utf-8", errors="replace")
+    origin_status_raw = next((v for k, v in headers.items() if k.lower() == "x-patchproof-origin-status"), "200")
+    try:
+        origin_status = int(origin_status_raw)
+    except (TypeError, ValueError):
+        origin_status = 200
 
     parser = PageFacts()
     parser.feed(html)
     findings = []
     hmap = {k.lower(): v for k, v in headers.items()}
 
+    is_https = urlparse(final_url).scheme.lower() == "https"
+    tls_verified = (next((v for k, v in headers.items() if k.lower() == "x-patchproof-tls-verified"), "true").lower() == "true") if is_https else None
+    tls_unverified = bool(is_https and not tls_verified)
+    tls_mode = (next((v for k, v in headers.items() if k.lower() == "x-patchproof-tls-mode"), "verified") if tls_verified else "diagnostic-unverified") if is_https else "plain-http"
+    tls_warning = next((v for k, v in headers.items() if k.lower() == "x-patchproof-tls-warning"), "")
+    chain_repaired = bool(is_https and tls_verified and any(
+        k.lower() == "x-patchproof-tls-chain-repair" for k in headers))
+    chain_source = next((v for k, v in headers.items() if k.lower() == "x-patchproof-tls-chain-source"), "")
     posture = evaluate_security_posture(html, headers, final_url, parser)
+    leaf_raw = next((v for k, v in headers.items() if k.lower() == "x-patchproof-tls-leaf"), "")
+    try:
+        tls_certificate = json.loads(leaf_raw) if leaf_raw else None
+    except ValueError:
+        tls_certificate = None
+    if is_https and tls_verified and tls_certificate:
+        cert_warnings = tls_certificate.get("warnings") or []
+        posture["checks"].append({
+            "name": "TLS Certificate Strength",
+            "status": "review" if cert_warnings else "pass",
+            "detail": ("; ".join(cert_warnings) if cert_warnings else
+                        f"{tls_certificate.get('signature', '')}; key {tls_certificate.get('key', '')}; "
+                        f"valid until {tls_certificate.get('not_after', '')[:10]}."),
+        })
+    if chain_repaired:
+        posture["checks"].append({
+            "name": "TLS Certificate Chain Completeness",
+            "status": "review",
+            "detail": "The server did not send its intermediate certificate. Verification succeeded only after fetching it from the certificate's AIA URL, as browsers do. Many non-browser clients will fail.",
+        })
+        posture["score"] = max(0, posture["score"] - 5)
+        findings.append(finding(
+            "TLS-CHAIN-001",
+            "Server sends an incomplete TLS certificate chain (missing intermediate)",
+            "TLS / Transport Security", "Medium", "High", "Observed",
+            "HTTPS Certificate Chain", "—",
+            "Certificate verification succeeded only after downloading the issuer certificate from " + (chain_source or "the AIA URL") + ".",
+            "Browsers hide this fault by fetching the intermediate themselves, but curl, Python, Java, mobile apps, API clients and some corporate proxies fail with 'unable to get local issuer certificate'.",
+            "Serve the CA-provided full chain (leaf + every intermediate): nginx ssl_certificate fullchain.pem; Apache SSLCertificateFile with the bundled chain; or re-upload the full chain on the CDN/load balancer. Verify with: openssl s_client -connect host:443 -servername host",
+        ))
+    if tls_unverified:
+        posture["checks"].append({
+            "name": "TLS Certificate & Hostname Validation",
+            "status": "fail",
+            "detail": "The HTTPS page was retrieved only for passive diagnostics. The origin certificate/hostname was NOT authenticated.",
+        })
+        posture["score"] = max(0, posture["score"] - 40)
+        posture["note"] = (posture.get("note", "") + " TLS identity is unverified; treat all origin content as untrusted.").strip()
+        findings.append(finding(
+            "TLS-UNVERIFIED-001",
+            "Origin TLS certificate could not be verified — diagnostic-only retrieval",
+            "TLS / Transport Security", "High", "High", "Observed",
+            "HTTPS Certificate", "—", tls_warning or "Certificate verification failed; the page was retrieved in restricted diagnostic mode.",
+            "PatchProof could retrieve this public page over an encrypted TLS session, but could not authenticate the server certificate and hostname. The response may have been intercepted or altered; treat its HTML and headers as untrusted evidence.",
+            "Repair the origin certificate chain or install the organization-approved root CA. Re-scan with verified TLS before treating findings as authoritative.",
+        ))
 
     header_rules = {
         "content-security-policy": (
@@ -1747,9 +2903,18 @@ def inspect_url(raw_url, *, _fetcher=None, _browser_audit=None, _allow_private_f
             f["current_fixed"] = current_fixed
             findings.append(f)
 
-    browser_runner = _browser_audit or run_browser_audit
-    browser_report, browser_findings = browser_runner(final_url)
-    findings.extend(browser_findings)
+    if not tls_unverified:
+        browser_runner = _browser_audit or run_browser_audit
+        browser_report, browser_findings = browser_runner(final_url)
+        findings.extend(browser_findings)
+    else:
+        # Never execute untrusted page scripts or load third-party resources
+        # after the origin certificate failed authentication.
+        browser_report, browser_findings = ({
+            "available": False,
+            "message": "Skipped: origin TLS identity is unverified. Static passive diagnostics only; page scripts and third-party resources were not executed.",
+            "checks": [], "runtime_errors": [], "failed_requests": [], "http_errors": [],
+        }, [])
     findings.sort(key=lambda x: (x["priority_score"], x["severity"]), reverse=True)
 
     ai_suggestions = [
@@ -1766,6 +2931,7 @@ def inspect_url(raw_url, *, _fetcher=None, _browser_audit=None, _allow_private_f
     return {
         "mode": "website",
         "final_url": final_url,
+        "http_status": origin_status,
         "overview": {
             "title": parser.title.strip() or "(No page title)",
             "html_bytes": len(body),
@@ -1778,6 +2944,7 @@ def inspect_url(raw_url, *, _fetcher=None, _browser_audit=None, _allow_private_f
             "browser_checks": len(browser_report.get("checks", [])),
             "browser_runtime_errors": len(browser_report.get("runtime_errors", [])),
             "findings_count": len(findings),
+            "http_status": origin_status,
         },
         "headers": {k: v for k, v in headers.items() if k.lower() in set(header_rules) | {"server", "content-type"}},
         "security_posture": posture,
@@ -1785,6 +2952,15 @@ def inspect_url(raw_url, *, _fetcher=None, _browser_audit=None, _allow_private_f
             "scanned_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "origin_headers_only": True,
             "patches_deployed_to_origin": False,
+            "tls_verified": tls_verified,
+            "tls_unverified": tls_unverified,
+            "tls_mode": tls_mode,
+            "tls_chain_complete": (not chain_repaired) if is_https else None,
+            "tls_chain_repaired_via_aia": chain_repaired,
+            "tls_certificate": tls_certificate,
+            "tls_warning": tls_warning if tls_unverified else "",
+            "authoritative_for_tls": bool(tls_verified),
+            "browser_execution_skipped": tls_unverified,
         },
         "browser": browser_report,
         "findings": findings,
@@ -3739,7 +4915,7 @@ async function inspectWebsite() {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url })
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Inspection failed.');
+    if (!res.ok) { const inspectError = new Error(data.error || 'Inspection failed.'); inspectError.tls = data.tls_diagnostics || null; throw inspectError; }
 
     let sameOrigin = false;
     try { sameOrigin = !!previous && new URL(previous.final_url).origin === new URL(data.final_url).origin; } catch (_) {}
@@ -3760,8 +4936,44 @@ async function inspectWebsite() {
     appliedFixes.clear(); deniedFixes.clear();
     syncAllTabs(data);
   } catch (err) {
-    $('findings-container').innerHTML = `<div class="scan-error"><b>Inspection failed</b><p>${esc(err.message)}</p><button class="btn-glass" onclick="switchTab('overview')">Back to Overview</button></div>`;
+    const tlsFailure = /TLS certificate verification failed|TLS handshake failed/i.test(String(err.message || ''));
+    const title = tlsFailure ? 'Website TLS verification blocked inspection' : 'Inspection failed';
+    const explanation = tlsFailure
+      ? '<p>PatchProof connected to the backend but could not establish a verified HTTPS session with the website. Verification was not disabled. The report below shows the exact certificate problem and the next step.</p>'
+      : '';
+    $('findings-container').innerHTML = `<div class=\"scan-error\"><b>${title}</b>${explanation}<p>${esc(err.message)}</p>${err.tls ? renderTlsDiagnostics(err.tls) : ''}<button class=\"btn-glass\" onclick=\"switchTab('overview')\">Back to Overview</button></div>`;
   }
+}
+
+function renderTlsDiagnostics(d) {
+  const leaf = d.leaf || {};
+  const codeText = (d.verify_code !== null && d.verify_code !== undefined) ? 'code ' + d.verify_code + ' - ' : '';
+  const rows = [
+    ['Verification', codeText + (d.verify_message || '')],
+    ['Cause', d.explanation || ''],
+    ['Certificate', leaf.subject || '(not read)'],
+    ['Issued by', leaf.issuer || '(not read)'],
+    ['Valid', leaf.not_before ? leaf.not_before.slice(0, 10) + ' to ' + leaf.not_after.slice(0, 10) + ' (' + (leaf.days_left < 0 ? 'expired ' + (-leaf.days_left) + ' day(s) ago' : leaf.days_left + ' day(s) left') + ')' : '-'],
+    ['Algorithms', leaf.signature ? leaf.signature + '; key ' + leaf.key : '-'],
+    ['Covers', (leaf.dns_names || []).join(', ') || '-'],
+    ['CA Issuers link', (leaf.aia_ca_issuers || []).join(', ') || 'none in certificate'],
+    ['Top issuer', d.top_issuer || '-']
+  ];
+  if (d.final_verify_code !== undefined && d.final_verify_code !== null) {
+    rows.splice(1, 0, ['After repair', 'code ' + d.final_verify_code + ' - ' + (d.final_verify_message || '')]);
+  }
+  (d.aia_downloads || []).forEach(function (x) { rows.push(['Fetched', x.url + ' -> ' + x.certificates + ' certificate(s)']); });
+  const table = rows.map(function (r) {
+    return '<tr><td style="padding:4px 14px 4px 0;color:var(--ink-muted);white-space:nowrap;vertical-align:top;">' + esc(r[0]) + '</td><td style="padding:4px 0;word-break:break-word;">' + esc(r[1]) + '</td></tr>';
+  }).join('');
+  const steps = (d.steps || []).map(function (s) { return '<li style="margin:6px 0;">' + esc(s) + '</li>'; }).join('');
+  return '<div class="glass-panel" style="margin:14px auto;max-width:860px;text-align:left;">' +
+    '<div class="eyebrow">TLS diagnostic report</div>' +
+    '<table style="width:100%;border-collapse:collapse;font-size:13px;">' + table + '</table>' +
+    '<div class="eyebrow" style="margin-top:14px;">What to do next</div>' +
+    '<ol style="padding-left:20px;margin:6px 0 0;font-size:13px;">' + steps + '</ol>' +
+    '<p style="font-size:12px;color:var(--ink-muted);margin-top:12px;">Verification was not disabled. The same report is available in the terminal: python this-file --tls-check https://your-site</p>' +
+    '</div>';
 }
 
 async function runPracticeFixture() {
@@ -4055,7 +5267,8 @@ function syncFixAllButton() {
   if (!activeReport) { buttons.forEach(button => { button.disabled = true; }); return; }
   const findings = activeReport.findings || [];
   const isWebsite = activeReport.mode === 'website';
-  const websiteFixable = findings.filter(f => f.fix_type && Object.prototype.hasOwnProperty.call({csp:1,hsts:1,nosniff:1,referrer:1,permissions:1}, f.fix_type));
+  const tlsUnverified = isWebsite && activeReport.scan_meta?.tls_unverified === true;
+  const websiteFixable = tlsUnverified ? [] : findings.filter(f => f.fix_type && Object.prototype.hasOwnProperty.call({csp:1,hsts:1,nosniff:1,referrer:1,permissions:1}, f.fix_type));
   const fixable = isWebsite ? websiteFixable : findings.filter(f => f.patch_id && (f.patch_available || f.can_try));
   const patchSetCount = new Set(fixable.map(f => f.patch_id).filter(Boolean)).size;
   const canAct = fixable.length > 0;
@@ -4068,17 +5281,25 @@ function syncFixAllButton() {
   });
   const next = $('overview-next-step');
   if (next) next.textContent = isWebsite
-    ? `${fixable.length} response-header control(s) can be simulated and verified in the local sandbox; origin deployment remains separate.`
+    ? (tlsUnverified ? 'Passive inspection completed, but sandbox fixes and previews are disabled until the origin TLS certificate is trusted.' : `${fixable.length} response-header control(s) can be simulated and verified in the local sandbox; origin deployment remains separate.`)
     : `${fixable.length} finding(s) are covered by ${patchSetCount} safe patch set(s). Apply them in an isolated copy, then review the proof.`;
 }
 
 function renderFindingsList(findings) {
+  const reportTls = activeReport?.mode === 'website' ? (activeReport.scan_meta || {}) : {};
+  const tlsBanner = reportTls.tls_unverified === true
+    ? `<div class="glass-panel" role="alert" style="border:1px solid #e8a23a;border-left:5px solid #e8a23a;padding:16px;margin-bottom:14px;background:rgba(155,95,20,.10);">
+        <b style="color:#f0b35c;">⚠ TLS UNVERIFIED — PASSIVE DIAGNOSTIC ONLY</b>
+        <p style="margin:7px 0 0;color:var(--ink-secondary);">PatchProof retrieved the page using encrypted HTTPS after normal certificate verification failed. The server identity is not authenticated. HTML and headers are untrusted evidence. Browser scripts, third-party resources, previews and automatic actions are not run in this mode.</p>
+        <p style="margin:7px 0 0;color:var(--ink-muted);font-size:11px;">${esc(reportTls.tls_warning || 'Origin certificate verification failed.')}</p>
+      </div>` : '';
   if (!findings.length) {
-    $('findings-container').innerHTML = `<div class="empty-findings"><div class="empty-icon">✓</div><b>No active findings</b><p>The latest scan did not detect actionable issues.</p></div>`;
+    $('findings-container').innerHTML = tlsBanner + `<div class="empty-findings"><div class="empty-icon">✓</div><b>No active findings</b><p>The latest scan did not detect actionable issues.</p></div>`;
     return;
   }
 
   const isWebsite = activeReport?.mode === 'website';
+  const tlsUnverified = isWebsite && activeReport?.scan_meta?.tls_unverified === true;
   const html = findings.map((f, idx) => {
     const isApplied = !isWebsite && appliedFixes.has(f.id);
     const sandboxApplied = isWebsite && (activeReport?.sandbox_state?.applied_fix_types || []).includes(f.fix_type);
@@ -4086,9 +5307,11 @@ function renderFindingsList(findings) {
     const cardClass = isDenied ? 'denied' : ((isApplied || sandboxApplied) ? 'applied' : (f.severity === 'High' || f.severity === 'Critical' ? 'high' : 'medium'));
     const severityClass = (f.severity === 'High' || f.severity === 'Critical') ? 'high' : 'medium';
     const action = isWebsite
-      ? (sandboxApplied
-          ? `<span class="pill-tag applied">✓ Sandbox control applied</span>`
-          : (f.fix_type ? `<button class="btn-purple" onclick="tryFix('${esc(f.id)}', ${idx})">Fix & Verify</button>` : `<span class="pill-tag neutral">Manual review</span>`))
+      ? (tlsUnverified
+          ? `<span class="pill-tag high">TLS trust required before sandbox fixes</span>`
+          : (sandboxApplied
+              ? `<span class="pill-tag applied">✓ Sandbox control applied</span>`
+              : (f.fix_type ? `<button class="btn-purple" onclick="tryFix('${esc(f.id)}', ${idx})">Fix & Verify</button>` : `<span class="pill-tag neutral">Manual review</span>`)))
       : (isApplied
           ? `<span class="pill-tag applied">✓ Verified on patched copy</span><button class="btn-glass" onclick="revertFix('${esc(f.id)}')">Revert</button>`
           : (f.patch_id && (f.patch_available || f.can_try)
@@ -4126,9 +5349,9 @@ function renderFindingsList(findings) {
         ${isWebsite ? '<div class="origin-note">Fix applies a policy overlay to the local comparison sandbox. It does not change the public origin; deploy the recommended headers at your server/CDN to protect real visitors.</div>' : ''}
       </article>`;
   }).join('');
-  $('findings-container').innerHTML = html;
+  $('findings-container').innerHTML = tlsBanner + html;
   const fixableCount = isWebsite
-    ? findings.filter(f => f.fix_type && ['csp','hsts','nosniff','referrer','permissions'].includes(f.fix_type)).length
+    ? (tlsUnverified ? 0 : findings.filter(f => f.fix_type && ['csp','hsts','nosniff','referrer','permissions'].includes(f.fix_type)).length)
     : findings.filter(f => f.patch_id && (f.patch_available || f.can_try)).length;
   const uniquePatchCount = isWebsite ? new Set(findings.filter(f => f.fix_type).map(f => f.fix_type)).size : new Set(findings.filter(f => f.patch_id && (f.patch_available || f.can_try)).map(f => f.patch_id)).size;
   const manualCount = isWebsite ? findings.filter(f => !f.fix_type).length : findings.filter(f => !f.patch_id).length;
@@ -4165,6 +5388,9 @@ function showToast(message) {
 
 async function applyWebsiteSandboxFixes(fixTypes) {
   if (!activeReport || activeReport.mode !== 'website') return;
+  if (activeReport.scan_meta?.tls_unverified === true) {
+    return showToast('Sandbox fixes are disabled until the website TLS certificate is trusted. The current report is passive diagnostic evidence only.');
+  }
   const selected = [...new Set([...(activeReport.sandbox_state?.applied_fix_types || []), ...(fixTypes || [])].filter(x => ['csp','hsts','nosniff','referrer','permissions'].includes(x)))];
   if (!selected.length) return showToast('No supported website header fixes are available for this scan.');
   const buttons = [$('btn-fix-all-suggestions'), $('btn-fix-all-overview')].filter(Boolean);
@@ -4387,6 +5613,7 @@ function copyUpdatedCode() {
 
 function renderVerificationTab(data, baseScore, currentScore) {
   const isWeb = data.mode === 'website';
+  const tlsUnverified = isWeb && data.scan_meta?.tls_unverified === true;
   const resolvedCount = getResolvedCount(data);
   animateNumber($('delta-before-score'), baseScore);
   animateNumber($('delta-after-score'), currentScore);
@@ -4413,7 +5640,7 @@ function renderVerificationTab(data, baseScore, currentScore) {
     const fixedLabel = isWeb ? (sandboxFixed ? '✓ Applied in preview sandbox' : '✓ Confirmed on origin re-scan') : '✓ Verified in patched copy';
     const pendingLabel = isWeb ? 'Awaiting origin deployment' : 'Patch pending';
     const action = isWeb
-      ? (!isFixed && f.fix_type ? `<button class="btn-purple" onclick="applyWebsiteSandboxFixes(['${esc(f.fix_type)}'])">Fix & Verify</button>` : '')
+      ? (tlsUnverified ? '<span class="pill-tag high">TLS trust required before sandbox fixes</span>' : (!isFixed && f.fix_type ? `<button class="btn-purple" onclick="applyWebsiteSandboxFixes(['${esc(f.fix_type)}'])">Fix & Verify</button>` : ''))
       : (!isFixed && f.patch_id ? `<button class="btn-purple" onclick="tryFix('${esc(f.id)}', ${allFindings.findIndex(x => x.id === f.id)})">Apply & Verify</button>` : '');
     return `
       <div class="bug-fixed-row ${isFixed ? 'is-fixed' : 'is-pending'}">
@@ -4434,17 +5661,20 @@ function renderVerificationTab(data, baseScore, currentScore) {
   $('bug-fixed-matrix-container').innerHTML = matrixHtml || '<div class="empty-findings"><b>No baseline findings</b><p>Run a scan to start a version comparison.</p></div>';
 
   const previewLaunch = $('website-preview-launch');
-  if (previewLaunch) previewLaunch.style.display = 'grid';
+  if (previewLaunch) previewLaunch.style.display = tlsUnverified ? 'none' : 'grid';
   if (isWeb) {
     $('bug-compare-section').style.display = 'block';
-    $('website-compare-container').style.display = 'block';
+    $('website-compare-container').style.display = tlsUnverified ? 'none' : 'block';
     $('code-verification-container').style.display = 'none';
     const previewInput = $('compare-preview-url');
     if (previewInput) previewInput.value = data.final_url || '';
     const targetUrl = data.final_url;
     const appliedTypes = data.sandbox_state?.applied_fix_types || [];
     const signature = `${targetUrl}|${[...appliedTypes].sort().join(',')}`;
-    if (targetUrl && signature !== window.__ppPreviewSignature) {
+    if (tlsUnverified) {
+      const compareTitle = $('website-compare-title');
+      if (compareTitle) compareTitle.textContent = 'Preview unavailable until the origin TLS certificate is trusted. Static passive findings remain available.';
+    } else if (targetUrl && signature !== window.__ppPreviewSignature) {
       window.__ppPreviewUrl = targetUrl;
       window.__ppPreviewSignature = signature;
       const compareTitle = $('website-compare-title');
@@ -4522,11 +5752,22 @@ def challenge_demo_api():
 @app.post("/api/inspect")
 def inspect_api():
     try:
-        data = request.get_json(silent=True) or {}
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify(error="Expected a JSON object containing url.", error_type="invalid_request"), 400
         url = data.get("url", "")
         return jsonify(inspect_url(url))
+    except TLSVerificationBlocked as exc:
+        # The app handled the request; the website certificate was not trusted.
+        return jsonify(error=str(exc), error_type="upstream_tls", backend_status="reachable",
+                       tls_diagnostics=exc.diagnostics), 502
     except Exception as exc:
-        return jsonify(error=str(exc)), 400
+        message = str(exc)
+        if message.startswith("TLS handshake failed for "):
+            return jsonify(error=message, error_type="upstream_tls", backend_status="reachable"), 502
+        if message.startswith("Could not connect to the public website "):
+            return jsonify(error=message, error_type="upstream_connection", backend_status="reachable"), 502
+        return jsonify(error=message, error_type="inspection_error"), 400
 
 
 @app.post("/api/analytics/stats")
@@ -4534,6 +5775,8 @@ def analytics_stats_api():
     """Server-side aggregate statistics for live source/website scan results."""
     try:
         payload = request.get_json(silent=True) or {}
+        if not isinstance(payload, dict):
+            return jsonify(error="Expected a JSON object for analytics."), 400
         raw_findings = payload.get("findings") or []
         if not isinstance(raw_findings, list) or len(raw_findings) > 1000:
             return jsonify(error="Invalid analytics findings payload."), 400
@@ -4548,7 +5791,7 @@ def analytics_stats_api():
                 "can_try": bool(item.get("can_try")),
                 "patch_available": bool(item.get("patch_available")),
                 "fix_type": str(item.get("fix_type") or ""),
-                "priority_score": max(0, min(100, int(item.get("priority_score") or 0))),
+                "priority_score": _clamp_priority(item.get("priority_score")),
             })
         analytics = build_analytics(normalized)
         coverage = payload.get("challenge_coverage") or {}
@@ -4572,7 +5815,9 @@ def analytics_stats_api():
 def website_sandbox_fix_api():
     """Apply a vetted response-header overlay for comparison only; never writes to the remote origin."""
     try:
-        payload = request.get_json(silent=True) or {}
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify(error="Expected a JSON object containing url and fix_types."), 400
         raw_url = payload.get("url", "")
         url = safe_public_url(raw_url)
         requested = payload.get("fix_types") or []
@@ -4622,11 +5867,16 @@ def preview_api():
         with sync_playwright() as playwright:
             browser = launch_chromium(playwright)
             try:
-                page = browser.new_page(viewport={"width": 1440, "height": 900})
-                page.goto(target, wait_until="domcontentloaded", timeout=18000)
-                page.wait_for_timeout(800)
-                img = page.screenshot(type="png", full_page=True)
-                return send_file(io.BytesIO(img), mimetype="image/png", max_age=0)
+                context = browser.new_context(viewport={"width": 1440, "height": 900}, service_workers="block")
+                guard_browser_context(context)
+                try:
+                    page = context.new_page()
+                    page.goto(target, wait_until="domcontentloaded", timeout=18000)
+                    page.wait_for_timeout(800)
+                    img = page.screenshot(type="png", full_page=True)
+                    return send_file(io.BytesIO(img), mimetype="image/png", max_age=0)
+                finally:
+                    context.close()
             finally:
                 browser.close()
     except Exception as exc:
@@ -4751,7 +6001,8 @@ def audit_api():
     root = Path(tempfile.mkdtemp(prefix="user_proj_", dir=PROJECT_WORKSPACE))
     try:
         if upload:
-            if not upload.filename.lower().endswith(".zip"):
+            upload_name = (upload.filename or "").strip()
+            if not upload_name.lower().endswith(".zip"):
                 raise ValueError("Project archive must be a valid .zip file.")
             count = extract_safe_zip(upload, root)
         else:
@@ -4759,19 +6010,27 @@ def audit_api():
             for item in source_uploads:
                 raw_name = (item.filename or "").replace("\\", "/")
                 rel = PurePosixPath(raw_name)
-                if not raw_name or rel.is_absolute() or ".." in rel.parts:
+                if (not raw_name or rel.is_absolute() or ".." in rel.parts
+                        or rel.suffix.lower() not in SOURCE_SCAN_EXTENSIONS):
                     continue
+                if count >= MAX_SOURCE_FILES:
+                    raise ValueError(f"Upload exceeds the {MAX_SOURCE_FILES}-file source limit.")
                 target = (root / Path(*rel.parts)).resolve()
                 if root.resolve() not in target.parents:
                     continue
+                content = item.read(MAX_SOURCE_BYTES + 1)
+                if len(content) > MAX_SOURCE_BYTES:
+                    raise ValueError(f"Source file exceeds the {MAX_SOURCE_BYTES // (1024 * 1024)} MB per-file limit: {rel.name}")
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(item.read(MAX_SOURCE_BYTES + 1))
+                target.write_bytes(content)
                 count += 1
 
         if count == 0:
             raise ValueError("No valid supported source files found in upload.")
 
         result = audit_source_tree(root)
+        if result.get("overview", {}).get("files_scanned", 0) == 0:
+            raise ValueError("No supported source code files (.py, .js, .ts, .html, .css, etc.) were found in the upload.")
         candidates = result.pop("_patch_candidates", [])
         result["patch_candidates"] = [{k: v for k, v in c.items() if k not in {"old_source", "new_source"}} for c in candidates]
         result["project_id"] = session_id
@@ -4789,9 +6048,18 @@ def audit_api():
 @app.post("/api/apply-patch")
 def apply_patch_api():
     """Apply one more patch while preserving all previously verified selections."""
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify(error="Expected a JSON object containing project_id and patch_id."), 400
     project_id = data.get("project_id", "")
     patch_id = data.get("patch_id", "")
+    if not isinstance(project_id, str) or not isinstance(patch_id, str) or not project_id or not patch_id:
+        return jsonify(error="project_id and patch_id must be non-empty strings."), 400
+    if not isinstance(data.get("run_tests", True), bool):
+        return jsonify(error="run_tests must be a boolean."), 400
+    runner = data.get("test_runner", "unittest")
+    if not isinstance(runner, str) or runner not in {"unittest", "pytest"}:
+        return jsonify(error="test_runner must be 'unittest' or 'pytest'."), 400
     session = PROJECT_SESSIONS.get(project_id)
     if not session or patch_id not in session.get("candidates", {}):
         return jsonify(error="Project session or patch candidate expired. Upload and scan again."), 404
@@ -4800,7 +6068,7 @@ def apply_patch_api():
         result = apply_patch_set(
             project_id, patch_ids=selected_ids,
             run_tests=bool(data.get("run_tests", True)),
-            runner=data.get("test_runner", "unittest"),
+            runner=runner,
         )
         return jsonify(result), (200 if result.get("status") in {"passed", "partial"} else 422)
     except Exception as exc:
@@ -4809,15 +6077,31 @@ def apply_patch_api():
 
 @app.post("/api/apply-all")
 def apply_all_api():
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify(error="Expected a JSON object containing project_id and optional patch_ids."), 400
     project_id = data.get("project_id", "")
     patch_ids = data.get("patch_ids") if "patch_ids" in data else None
+    if not isinstance(project_id, str) or not project_id:
+        return jsonify(error="project_id must be a non-empty string."), 400
+    if patch_ids is not None and (not isinstance(patch_ids, list) or any(not isinstance(x, str) for x in patch_ids)):
+        return jsonify(error="patch_ids must be a list of patch ID strings."), 400
+    session = PROJECT_SESSIONS.get(project_id)
+    if not session:
+        return jsonify(error="Project session expired. Upload and scan again."), 404
+    if patch_ids is not None and any(patch_id not in session.get("candidates", {}) for patch_id in patch_ids):
+        return jsonify(error="One or more patch IDs do not belong to this project session."), 404
+    if not isinstance(data.get("run_tests", True), bool):
+        return jsonify(error="run_tests must be a boolean."), 400
+    runner = data.get("test_runner", "unittest")
+    if not isinstance(runner, str) or runner not in {"unittest", "pytest"}:
+        return jsonify(error="test_runner must be 'unittest' or 'pytest'."), 400
     try:
         result = apply_patch_set(
             project_id,
             patch_ids=patch_ids,
             run_tests=bool(data.get("run_tests", True)),
-            runner=data.get("test_runner", "unittest"),
+            runner=runner,
         )
         return jsonify(result), (200 if result.get("status") in {"passed", "partial"} else 422)
     except Exception as exc:
@@ -4844,6 +6128,16 @@ def download_sample_api():
                     arc.write(p, p.relative_to(root).as_posix())
     mem.seek(0)
     return send_file(mem, mimetype="application/zip", as_attachment=True, download_name="patchproof_24h_practice_fixture.zip")
+
+
+# TEST-ONLY throwaway certificate chain (valid to 2099), used by the built-in self-test to
+# exercise missing-intermediate repair offline. It is trusted by nothing else.
+_TLS_TEST_FIXTURES = {
+    "root": "-----BEGIN CERTIFICATE-----\nMIIBiTCCATCgAwIBAgIUGwmGcKgE8EIOcvBzLGT+2Qk6fXMwCgYIKoZIzj0EAwIw\nIjEgMB4GA1UEAwwXUGF0Y2hQcm9vZiBGaXh0dXJlIFJvb3QwIBcNMjUwMTAxMDAw\nMDAwWhgPMjA5OTEyMzEwMDAwMDBaMCIxIDAeBgNVBAMMF1BhdGNoUHJvb2YgRml4\ndHVyZSBSb290MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEPydK5GsIc00FUAVx\nRUkf87cpq4fOAuJF7svw3hthgQigF8bIg2LXjoN19nVhRN5NOboSBegDuuY5PQmG\nE3fdXqNCMEAwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQU0wF63f4OtAWy/o7S\nJNCY4rzlyDowDgYDVR0PAQH/BAQDAgEGMAoGCCqGSM49BAMCA0cAMEQCIBZmDbOc\nuRDaH0qk96BfnygI5bH5KXncYEc9J2vSqmqnAiAkkkJf+x/gUUZqOSJrBrwzZB4S\nTU7MUTJmmr8tnd97OA==\n-----END CERTIFICATE-----\n",
+    "inter": "-----BEGIN CERTIFICATE-----\nMIIBtjCCAVygAwIBAgIUQJTMQql+IJeHvaacKqzbdzApvzYwCgYIKoZIzj0EAwIw\nIjEgMB4GA1UEAwwXUGF0Y2hQcm9vZiBGaXh0dXJlIFJvb3QwIBcNMjUwMTAxMDAw\nMDAwWhgPMjA5OTEyMzEwMDAwMDBaMCoxKDAmBgNVBAMMH1BhdGNoUHJvb2YgRml4\ndHVyZSBJbnRlcm1lZGlhdGUwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARneT4Y\nmdeYO0uGK6GYeJl0N6ZD3Qv+jBaiey+LqAkzykObM2hiPVZQxtVLSuTbjFfk/YW2\nsto1/5YVytBwnRiIo2YwZDASBgNVHRMBAf8ECDAGAQH/AgEAMB0GA1UdDgQWBBQP\nkwVd9mt45X4S50Y+qDv5w4XMSzAfBgNVHSMEGDAWgBTTAXrd/g60BbL+jtIk0Jji\nvOXIOjAOBgNVHQ8BAf8EBAMCAQYwCgYIKoZIzj0EAwIDSAAwRQIgHb2LvS4U8QLJ\nwOxi/MHSn02lwCRInofovJgNwuMSl90CIQCujqcJX2Ir48TOrBqeWfDccbyOa1Md\nsQWq4zo18348rg==\n-----END CERTIFICATE-----\n",
+    "leaf": "-----BEGIN CERTIFICATE-----\nMIICHjCCAcOgAwIBAgIUb2/PGcMii66+2bq+YFoeUWyFg5AwCgYIKoZIzj0EAwIw\nKjEoMCYGA1UEAwwfUGF0Y2hQcm9vZiBGaXh0dXJlIEludGVybWVkaWF0ZTAgFw0y\nNTAxMDEwMDAwMDBaGA8yMDk5MTIzMTAwMDAwMFowGjEYMBYGA1UEAwwPZml4dHVy\nZS5leGFtcGxlMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEbGbPStRw03noEZOT\nkTGj56k0R7CL6RY9DK0RWSdTp12/K8S/d4exEa4zEmV+UVYttAhE0bCMkuaXEwlF\nfZzx9aOB1DCB0TAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBQsbBsNmiiDKVMi7UFz\nJDDAmeLOijAfBgNVHSMEGDAWgBQPkwVd9mt45X4S50Y+qDv5w4XMSzAOBgNVHQ8B\nAf8EBAMCB4AwEwYDVR0lBAwwCgYIKwYBBQUHAwEwGgYDVR0RBBMwEYIPZml4dHVy\nZS5leGFtcGxlMEAGCCsGAQUFBwEBBDQwMjAwBggrBgEFBQcwAoYkaHR0cDovL2Fp\nYS5maXh0dXJlLmV4YW1wbGUvaW50ZXIuY2VyMAoGCCqGSM49BAMCA0kAMEYCIQDm\nhGZB8kGi7mYbuXF8H/5RmKiWHwXyUb0xZ5/UqqNUbgIhANvuyR1P0LtaN0Yvbz+h\nbGhGHaOdbAoaGc750TczwgSJ\n-----END CERTIFICATE-----\n",
+    "leaf_key": "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg9FSh3bm6nCydf3+s\n96LQkAT0rUphqIaYXYq53KV+DkChRANCAARsZs9K1HDTeegRk5ORMaPnqTRHsIvp\nFj0MrRFZJ1OnXb8rxL93h7ERrjMSZX5RVi20CETRsIyS5pcTCUV9nPH1\n-----END PRIVATE KEY-----\n",
+}
 
 
 def run_ultra_backend_diagnostics():
@@ -5053,8 +6347,9 @@ def run_ultra_backend_diagnostics():
             sid = secrets.token_urlsafe(12)
             PROJECT_SESSIONS[sid] = {"root": root, "candidates": {c["patch_id"]: c for c in audit.get("_patch_candidates", [])}, "patched": None, "applied_patch_ids": []}
             fixed = apply_patch_set(sid, ids, run_tests=True)
-            safe_sql = 'def lookup(db, name):\n    return db.execute("SELECT * FROM users WHERE name = ?", (name,)).fetchall()\n'
-            malicious_sql = """def lookup(db, name):
+            safe_sql = 'import sqlite3\ndef lookup(db, name):\n    return db.execute("SELECT * FROM users WHERE name = ?", (name,)).fetchall()\n'
+            malicious_sql = """import sqlite3
+def lookup(db, name):
     return db.execute("SELECT * FROM users WHERE name = '%s'" % name).fetchall()
 """
             safe_findings, safe_candidates = detect_sqlite_parameter_patches(safe_sql, "benign.py")
@@ -5141,6 +6436,441 @@ def run_ultra_backend_diagnostics():
         return f"criteria={','.join(ids)}; total weight={weights}%" if ids == list("ABCDEFGH") and weights == 100 else False
     check("Evaluation rubric A-H weightage totals 100%", weighted_rubric_check)
 
+    def unicode_ast_offsets_check():
+        source = """import sqlite3\ndef lookup(db, name):\n    label = \"café\"; return db.execute(\"SELECT * FROM users WHERE name = '%s'\" % name)\n"""
+        found, candidates = detect_sqlite_parameter_patches(source, "unicode_case.py")
+        return "UTF-8 AST byte columns converted to correct source character offsets" if candidates and ast.parse(candidates[0]["new_source"]) else False
+    check("Unicode-safe AST source patch offsets", unicode_ast_offsets_check)
+
+    def sql_existing_parameter_guard_check():
+        source = 'def lookup(db, name):\n    return db.execute("SELECT * FROM users WHERE name = ?", (name,))\n'
+        found, candidates = detect_sqlite_parameter_patches(source, "already_safe.py")
+        return "Already-parameterized execute() calls are left unchanged" if not candidates else False
+    check("SQL auto-patcher leaves existing parameter arguments alone", sql_existing_parameter_guard_check)
+
+    def sql_non_sqlite_guard_check():
+        source = """def lookup(db, name):\n    return db.execute(\"SELECT * FROM users WHERE name = '%s'\" % name)\n"""
+        found, candidates = detect_sqlite_parameter_patches(source, "non_sqlite.py")
+        return "Unknown database drivers are left for manual review" if not candidates else False
+    check("SQL auto-patcher requires explicit SQLite import", sql_non_sqlite_guard_check)
+
+    def path_signature_guard_check():
+        source = 'import os\ndef read_document(storage_root, filename):\n    target_path = os.path.join(storage_root, filename)\n    with open(target_path) as handle:\n        return handle.read()\n'
+        found, candidates = detect_path_traversal_patches(source, "custom_names.py")
+        return "Unknown path-helper signatures are left for manual review" if not candidates else False
+    check("Path patcher rejects unknown function signatures", path_signature_guard_check)
+
+    def access_control_signature_guard_check():
+        source = 'def can_delete(user):\n    return True\n'
+        found, candidates = detect_access_control_patches(source, "custom_auth.py")
+        return "Authorization helpers with unknown role semantics are left for manual review" if not candidates else False
+    check("Access-control patcher rejects unknown role parameter names", access_control_signature_guard_check)
+
+    def browser_private_request_guard_check():
+        class FakeRequest: 
+            def __init__(self, url): self.url = url
+        class FakeRoute:
+            def __init__(self, url): self.request = FakeRequest(url); self.action = None
+            def abort(self): self.action = "abort"
+            def continue_(self): self.action = "continue"
+        class FakeContext:
+            def route(self, pattern, handler): self.handler = handler
+        context = FakeContext()
+        guard_browser_context(context, {"count": 0})
+        private_route = FakeRoute("http://127.0.0.1/admin")
+        public_route = FakeRoute("data:text/plain,ok")
+        context.handler(private_route)
+        context.handler(public_route)
+        return "Private browser requests blocked; inert data URLs retained" if private_route.action == "abort" and public_route.action == "continue" else False
+    check("Playwright blocks private-network requests", browser_private_request_guard_check)
+
+    def tls_context_check():
+        context = build_public_tls_context()
+        secure = context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname
+        tls12 = context.minimum_version >= ssl.TLSVersion.TLSv1_2
+        backend = getattr(context, "_patchproof_tls_backend", "system-default")
+        return f"{backend}; certificate + hostname verification required; TLS >= 1.2" if secure and tls12 else False
+    check("HTTPS TLS uses native truststore or verified system+certifi fallback", tls_context_check)
+
+
+
+
+    def tls_strict_fetch_default_check():
+        global safe_public_url, _resolve_public_addresses, _request_public_once, _fetch_peer_leaf_der
+        old_safe, old_resolve, old_request = safe_public_url, _resolve_public_addresses, _request_public_once
+        old_leaf = _fetch_peer_leaf_der
+        _fetch_peer_leaf_der = lambda *a, **k: None
+        try:
+            safe_public_url = lambda value: value
+            _resolve_public_addresses = lambda parsed: ["203.0.113.31"]
+            _request_public_once = lambda *a, **k: (_ for _ in ()).throw(ssl.SSLCertVerificationError(20, "untrusted issuer"))
+            try:
+                fetch_public("https://strict-fixture.example/")
+            except ValueError as exc:
+                return "preview/sandbox/default fetch remains strict; no diagnostic fallback unless explicitly requested" if "TLS certificate verification failed" in str(exc) else False
+            return False
+        finally:
+            safe_public_url, _resolve_public_addresses, _request_public_once = old_safe, old_resolve, old_request
+            _fetch_peer_leaf_der = old_leaf
+    check("Non-inspection fetch paths retain strict TLS by default", tls_strict_fetch_default_check)
+
+    def unverified_fallback_default_off_check():
+        old_env = os.environ.pop("PATCHPROOF_ALLOW_UNVERIFIED_TLS_DIAGNOSTIC", None)
+        try:
+            return "Unverified diagnostic fallback is OFF unless the operator opts in" if not unverified_tls_diagnostics_enabled() else False
+        finally:
+            if old_env is not None:
+                os.environ["PATCHPROOF_ALLOW_UNVERIFIED_TLS_DIAGNOSTIC"] = old_env
+    check("Unverified TLS fallback is opt-in (default off)", unverified_fallback_default_off_check)
+
+
+
+    def https_downgrade_guard_check():
+        global safe_public_url, _resolve_public_addresses, _request_public_once
+        old_safe, old_resolve, old_request = safe_public_url, _resolve_public_addresses, _request_public_once
+        try:
+            safe_public_url = lambda value: value
+            _resolve_public_addresses = lambda parsed: ["203.0.113.20"]
+            _request_public_once = lambda *a, **k: (302, b"", {"Location": "http://public.example.test/clear"})
+            try:
+                fetch_public("https://public.example.test/")
+            except ValueError as exc:
+                return "HTTPS-to-HTTP downgrade redirects are rejected" if "downgrade" in str(exc).lower() else False
+            return False
+        finally:
+            safe_public_url, _resolve_public_addresses, _request_public_once = old_safe, old_resolve, old_request
+    check("HTTPS redirect downgrade protection", https_downgrade_guard_check)
+
+    def http_error_status_inspection_check():
+        global safe_public_url, _resolve_public_addresses, _request_public_once
+        old_safe, old_resolve, old_request = safe_public_url, _resolve_public_addresses, _request_public_once
+        try:
+            safe_public_url = lambda value: value
+            _resolve_public_addresses = lambda parsed: ["203.0.113.21"]
+            _request_public_once = lambda *a, **k: (403, b"Forbidden", {"Content-Type": "text/html"})
+            body, headers, final = fetch_public("https://public.example.test/private")
+            return "HTTP 403 page and response headers remain inspectable" if body == b"Forbidden" and headers.get("X-PatchProof-Origin-Status") == "403" else False
+        finally:
+            safe_public_url, _resolve_public_addresses, _request_public_once = old_safe, old_resolve, old_request
+    check("HTTP 401/403/404/5xx responses remain available for passive inspection", http_error_status_inspection_check)
+
+    def multi_address_fallback_check():
+        global safe_public_url, _resolve_public_addresses, _request_public_once
+        old_safe, old_resolve, old_request = safe_public_url, _resolve_public_addresses, _request_public_once
+        calls = []
+        try:
+            safe_public_url = lambda value: value
+            _resolve_public_addresses = lambda parsed: ["203.0.113.22", "203.0.113.23"]
+            def request_once(parsed, address, **kwargs):
+                calls.append(address)
+                if address.endswith("22"):
+                    raise TimeoutError("IPv6/CDN edge timeout")
+                return 200, b"OK", {"Content-Type": "text/html"}
+            _request_public_once = request_once
+            body, headers, final = fetch_public("https://public.example.test/")
+            return "Second validated CDN address used after first address timed out" if body == b"OK" and calls == ["203.0.113.22", "203.0.113.23"] else False
+        finally:
+            safe_public_url, _resolve_public_addresses, _request_public_once = old_safe, old_resolve, old_request
+    check("Multiple validated IPv4/IPv6/CDN address failover", multi_address_fallback_check)
+
+    def tls_context_uses_verified_fallback_check():
+        context = build_public_tls_context()
+        return "TLS context never allows unverified certificates" if context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname else False
+    check("TLS context never disables certificate or hostname validation", tls_context_uses_verified_fallback_check)
+
+    def native_truststore_selection_check():
+        import sys, types
+        original = sys.modules.get("truststore")
+        class FakeTruststore:
+            @staticmethod
+            def SSLContext(protocol):
+                return ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
+        try:
+            sys.modules["truststore"] = FakeTruststore
+            context = build_public_tls_context()
+            backend = getattr(context, "_patchproof_tls_backend", "")
+            return "Native truststore backend is preferred when installed" if backend == "native-system-truststore" and context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname else False
+        finally:
+            if original is None:
+                sys.modules.pop("truststore", None)
+            else:
+                sys.modules["truststore"] = original
+    check("Native truststore backend is selected when available", native_truststore_selection_check)
+
+    def compressed_response_decode_check():
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import gzip
+        payload = b"<!doctype html><title>compressed fixture</title>" + (b"PatchProof" * 1000)
+        packed = gzip.compress(payload)
+        class GzipHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Content-Length", str(len(packed)))
+                self.end_headers()
+                self.wfile.write(packed)
+            def log_message(self, *args):
+                pass
+        server = ThreadingHTTPServer(("127.0.0.1", 0), GzipHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            parsed = urlparse(f"http://fixture.example:{server.server_port}/")
+            status, decoded, headers = _request_public_once(parsed, "127.0.0.1", timeout=3)
+            return "gzip HTML decoded correctly within the configured response-size limit" if status == 200 and decoded == payload else False
+        finally:
+            server.shutdown(); server.server_close(); thread.join(timeout=2)
+    check("Bounded gzip response decoding", compressed_response_decode_check)
+
+    def idn_url_validation_check():
+        global _resolve_public_addresses
+        old_resolve = _resolve_public_addresses
+        try:
+            _resolve_public_addresses = lambda parsed: ["93.184.216.34"]
+            normalized = safe_public_url("https://bücher.example/path")
+            return "Internationalized hostnames normalize to IDNA ASCII" if "xn--" in normalized else False
+        finally:
+            _resolve_public_addresses = old_resolve
+    check("Internationalized domain (IDN) URL normalization", idn_url_validation_check)
+
+    def tls_failure_report_check():
+        parsed = urlparse("https://example.invalid/")
+        error = ssl.SSLCertVerificationError(20, "unable to get local issuer certificate")
+        report = _tls_failure_report(parsed, error, repair={"reason": "no_aia", "downloads": [],
+                                                            "top_issuer": "CN=Example Issuing CA",
+                                                            "top_issuer_country": "IN"}, addresses=())
+        message = _tls_failure_message(report)
+        steps = " ".join(report["steps"])
+        good = (report["cause"] == "missing_intermediate" and "Example Issuing CA" in report["explanation"]
+                and "PATCHPROOF_CA_BUNDLE" in steps and "Indian" in steps
+                and message.startswith("TLS certificate verification failed for example.invalid")
+                and "Certificate and hostname verification remain enabled" in message
+                and "will not disable TLS verification" in message)
+        return "Code 20 without AIA yields a specific cause, next steps, and an unchanged verification policy" if good else False
+    check("TLS failure report names the cause and next step", tls_failure_report_check)
+
+    def x509_parser_check():
+        leaf = ssl.PEM_cert_to_DER_cert(_TLS_TEST_FIXTURES["leaf"])
+        inter = ssl.PEM_cert_to_DER_cert(_TLS_TEST_FIXTURES["inter"])
+        root = ssl.PEM_cert_to_DER_cert(_TLS_TEST_FIXTURES["root"])
+        l, i, r = _parse_x509(leaf), _parse_x509(inter), _parse_x509(root)
+        good = (l["subject"] == "CN=fixture.example" and l["dns_names"] == ["fixture.example"]
+                and l["aia_ca_issuers"] == ["http://aia.fixture.example/inter.cer"]
+                and l["signature"] == "ecdsa-with-SHA256" and not l["self_signed"] and l["key"] == "EC"
+                and i["issuer"] == "CN=PatchProof Fixture Root" and r["self_signed"]
+                and l["not_before"].year == 2025 and l["not_after"].year == 2099)
+        return "Standard-library X.509 reader parses names, SAN, CA Issuers link, algorithms and validity" if good else False
+    check("Standard-library X.509 reader parses certificate fields", x509_parser_check)
+
+    def aia_payload_check():
+        inter = ssl.PEM_cert_to_DER_cert(_TLS_TEST_FIXTURES["inter"])
+        root = ssl.PEM_cert_to_DER_cert(_TLS_TEST_FIXTURES["root"])
+        der_ok = _certs_from_aia_response(inter) == [inter]
+        pem_ok = _certs_from_aia_response((_TLS_TEST_FIXTURES["inter"] + _TLS_TEST_FIXTURES["root"]).encode()) == [inter]
+        self_signed_dropped = _certs_from_aia_response(root) == []
+        signed_data = _der_tlv(0x30, _der_tlv(0x02, b"\x01") + _der_tlv(0x31, b"")
+                               + _der_tlv(0x30, _der_tlv(0x06, _oid("1.2.840.113549.1.7.1")))
+                               + _der_tlv(0xA0, inter))
+        p7 = _der_tlv(0x30, _der_tlv(0x06, _oid("1.2.840.113549.1.7.2")) + _der_tlv(0xA0, signed_data))
+        p7_ok = _certs_from_aia_response(p7) == [inter]
+        good = der_ok and pem_ok and self_signed_dropped and p7_ok
+        return "CA Issuers payloads: DER, PEM bundle and PKCS#7 accepted; self-signed roots always dropped" if good else False
+    check("CA Issuers payload parsing never imports self-signed anchors", aia_payload_check)
+
+    def aia_ssrf_check():
+        blocked = (_download_aia_certificates("http://127.0.0.1/inter.cer") == []
+                   and _download_aia_certificates("http://169.254.169.254/latest/meta-data") == [])
+        return "CA Issuers downloads to loopback and metadata addresses are refused" if blocked else False
+    check("CA Issuers repair is SSRF-safe", aia_ssrf_check)
+
+    def aia_repair_end_to_end_check():
+        global safe_public_url, _resolve_public_addresses, _request_public_once
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        inter_der = ssl.PEM_cert_to_DER_cert(_TLS_TEST_FIXTURES["inter"])
+
+        class AiaHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path != "/inter.cer":
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/pkix-cert")
+                self.send_header("Content-Length", str(len(inter_der)))
+                self.end_headers()
+                self.wfile.write(inter_der)
+
+            def log_message(self, *args):
+                pass
+
+        class OkHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = b"<!doctype html><title>chain fixture</title>"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        tmp = Path(tempfile.mkdtemp(prefix="pp_chain_"))
+        servers = []
+        old = (safe_public_url, _resolve_public_addresses, _request_public_once)
+        old_bundle = os.environ.get("PATCHPROOF_CA_BUNDLE")
+        try:
+            (tmp / "root.pem").write_text(_TLS_TEST_FIXTURES["root"], encoding="utf-8")
+            (tmp / "leaf.pem").write_text(_TLS_TEST_FIXTURES["leaf"] + _TLS_TEST_FIXTURES["leaf_key"], encoding="utf-8")
+            aia = ThreadingHTTPServer(("127.0.0.1", 0), AiaHandler)
+            servers.append(aia)
+            threading.Thread(target=aia.serve_forever, daemon=True).start()
+            server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            server_ctx.load_cert_chain(str(tmp / "leaf.pem"))
+            tls_server = ThreadingHTTPServer(("127.0.0.1", 0), OkHandler)
+            tls_server.socket = server_ctx.wrap_socket(tls_server.socket, server_side=True)
+            servers.append(tls_server)
+            threading.Thread(target=tls_server.serve_forever, daemon=True).start()
+
+            original_request = _request_public_once
+
+            def routed(parsed, address, **kwargs):
+                if parsed.hostname == "aia.fixture.example":
+                    parsed = parsed._replace(netloc=f"127.0.0.1:{aia.server_port}")
+                    return original_request(parsed, "127.0.0.1", **kwargs)
+                return original_request(parsed, address, **kwargs)
+
+            safe_public_url = lambda value: value
+            _resolve_public_addresses = lambda parsed: ["127.0.0.1"]
+            _request_public_once = routed
+            url = f"https://fixture.example:{tls_server.server_port}/"
+
+            # Scenario A: the root is NOT trusted. Repair must not invent trust.
+            os.environ.pop("PATCHPROOF_CA_BUNDLE", None)
+            try:
+                fetch_public(url)
+                return False
+            except TLSVerificationBlocked as exc:
+                d = exc.diagnostics
+                scenario_a = (d.get("cause") == "root_not_trusted" and d.get("top_issuer") == "CN=PatchProof Fixture Root"
+                              and d.get("aia_downloads") and d["aia_downloads"][0]["certificates"] == 1
+                              and "TLS certificate verification failed" in str(exc)
+                              and "will not disable TLS verification" in str(exc))
+            if not scenario_a:
+                return False
+
+            # Scenario B: root trusted via PATCHPROOF_CA_BUNDLE. Repair succeeds with full verification.
+            os.environ["PATCHPROOF_CA_BUNDLE"] = str(tmp / "root.pem")
+            body, headers, final = fetch_public(url)
+            leaf_meta = json.loads(headers.get("X-PatchProof-TLS-Leaf", "{}"))
+            scenario_b = (body == b"<!doctype html><title>chain fixture</title>"
+                          and headers.get("X-PatchProof-TLS-Verified") == "true"
+                          and headers.get("X-PatchProof-TLS-Chain-Repair") == "aia"
+                          and leaf_meta.get("signature") == "ecdsa-with-SHA256"
+                          and leaf_meta.get("problems") == [])
+            return "Missing intermediate fetched via CA Issuers; root must be trusted and an untrusted root is still rejected" if scenario_b else False
+        finally:
+            safe_public_url, _resolve_public_addresses, _request_public_once = old
+            if old_bundle is None:
+                os.environ.pop("PATCHPROOF_CA_BUNDLE", None)
+            else:
+                os.environ["PATCHPROOF_CA_BUNDLE"] = old_bundle
+            for server in servers:
+                server.shutdown()
+                server.server_close()
+            shutil.rmtree(tmp, ignore_errors=True)
+    check("Missing intermediate is repaired via CA Issuers with verification enforced", aia_repair_end_to_end_check)
+
+    def certificate_policy_check():
+        now = _DateTime(2026, 11, 1, tzinfo=_UTC.utc)
+        weak = {"weak_signature": True, "signature": "sha1WithRSAEncryption", "key_bits": 1024,
+                "not_before": _DateTime(2020, 1, 1, tzinfo=_UTC.utc), "not_after": _DateTime(2099, 1, 1, tzinfo=_UTC.utc)}
+        expired = {"weak_signature": False, "signature": "sha256WithRSAEncryption", "key_bits": 2048,
+                   "not_before": _DateTime(2020, 1, 1, tzinfo=_UTC.utc), "not_after": _DateTime(2026, 1, 1, tzinfo=_UTC.utc)}
+        weak_problems, _ = _assess_certificate(weak, now)
+        expired_problems, _ = _assess_certificate(expired, now)
+        leaf_info = _parse_x509(ssl.PEM_cert_to_DER_cert(_TLS_TEST_FIXTURES["leaf"]))
+        leaf_problems, _ = _assess_certificate(leaf_info, now)
+        good = len(weak_problems) == 2 and any("expired" in p for p in expired_problems) and leaf_problems == []
+        return "Certificate policy rejects SHA-1, sub-2048-bit RSA and expired certificates; the valid ECDSA fixture passes" if good else False
+    check("Certificate strength policy rejects weak and expired certificates", certificate_policy_check)
+
+    def hostname_match_check():
+        good = (_hostname_matches("bel-india.in", ["bel-india.in"])
+                and _hostname_matches("WWW.Example.com.", ["www.example.com"])
+                and _hostname_matches("a.example.com", ["*.example.com"])
+                and not _hostname_matches("a.b.example.com", ["*.example.com"])
+                and not _hostname_matches("example.org", ["*.example.com"]))
+        return "Hostname matching is case-insensitive and wildcards cover exactly one label" if good else False
+    check("Hostname matching follows certificate rules", hostname_match_check)
+
+    def tls_cli_report_check():
+        text = format_tls_diagnostics({"host": "x.example", "verify_code": 20,
+                                       "verify_message": "unable to get local issuer certificate",
+                                       "explanation": "Test cause.", "steps": ["Do the thing."],
+                                       "leaf": None, "aia_downloads": [], "top_issuer": ""})
+        good = "Test cause." in text and "code 20" in text and "1. Do the thing." in text and "NOT disabled" in text
+        return "Terminal TLS report prints the cause, verification code and numbered next steps" if good else False
+    check("Terminal TLS report is readable and complete", tls_cli_report_check)
+
+    def tls_fetch_error_propagation_check():
+        global safe_public_url, _resolve_public_addresses, _request_public_once, _fetch_peer_leaf_der
+        old = (safe_public_url, _resolve_public_addresses, _request_public_once, _fetch_peer_leaf_der)
+        try:
+            safe_public_url = lambda value: "https://tls-fixture.example/"
+            _resolve_public_addresses = lambda parsed: ["203.0.113.10"]
+            _fetch_peer_leaf_der = lambda *a, **k: None
+            _request_public_once = lambda *a, **k: (_ for _ in ()).throw(
+                ssl.SSLCertVerificationError(20, "unable to get local issuer certificate"))
+            try:
+                fetch_public("https://tls-fixture.example/")
+            except TLSVerificationBlocked as exc:
+                d = exc.diagnostics
+                good = (str(exc).startswith("TLS certificate verification failed for tls-fixture.example")
+                        and d.get("verify_code") == 20 and d.get("cause") == "unknown_chain"
+                        and "will not disable TLS verification" in str(exc))
+                return "Code 20 raises a structured TLSVerificationBlocked report; verification is never disabled" if good else False
+            return False
+        finally:
+            safe_public_url, _resolve_public_addresses, _request_public_once, _fetch_peer_leaf_der = old
+    check("Website inspection reports TLS verification failures clearly", tls_fetch_error_propagation_check)
+
+    def tls_diagnostic_fallback_check():
+        global safe_public_url, _resolve_public_addresses, _request_public_once, _fetch_peer_leaf_der
+        old = (safe_public_url, _resolve_public_addresses, _request_public_once, _fetch_peer_leaf_der)
+        old_env = os.environ.get("PATCHPROOF_ALLOW_UNVERIFIED_TLS_DIAGNOSTIC")
+        os.environ["PATCHPROOF_ALLOW_UNVERIFIED_TLS_DIAGNOSTIC"] = "1"
+        calls = []
+        try:
+            safe_public_url = lambda value: value
+            _resolve_public_addresses = lambda parsed: ["203.0.113.30"]
+            _fetch_peer_leaf_der = lambda *a, **k: None
+
+            def request_once(parsed, address, **kwargs):
+                context = kwargs.get("tls_context")
+                calls.append("verified" if context is None or context.verify_mode == ssl.CERT_REQUIRED else "unverified")
+                if context is None or context.verify_mode == ssl.CERT_REQUIRED:
+                    raise ssl.SSLCertVerificationError(20, "unable to get local issuer certificate")
+                if context.check_hostname:
+                    raise AssertionError("Diagnostic context must not claim hostname verification")
+                return 200, b"<html><title>diagnostic fixture</title></html>", {"Content-Type": "text/html"}
+
+            _request_public_once = request_once
+            body, headers, final = fetch_public("https://diag-fixture.example/", allow_unverified_tls=True)
+            marker = headers.get("X-PatchProof-TLS-Verified") == "false"
+            warning = "NOT authenticated" in headers.get("X-PatchProof-TLS-Warning", "")
+            good = calls == ["verified", "unverified"] and marker and warning and body.startswith(b"<html")
+            return "Verified request first; unverified retrieval only when opted in, and always marked" if good else False
+        finally:
+            safe_public_url, _resolve_public_addresses, _request_public_once, _fetch_peer_leaf_der = old
+            if old_env is None:
+                os.environ.pop("PATCHPROOF_ALLOW_UNVERIFIED_TLS_DIAGNOSTIC", None)
+            else:
+                os.environ["PATCHPROOF_ALLOW_UNVERIFIED_TLS_DIAGNOSTIC"] = old_env
+    check("Strict-first TLS diagnostic fallback is explicitly marked unverified", tls_diagnostic_fallback_check)
+
     check("Workspace/session isolation", lambda: PROJECT_WORKSPACE.exists() and MAX_PROJECT_SESSIONS >= 1)
     return report
 
@@ -5208,6 +6938,9 @@ def diagnostics_api():
         "flask": bool(importlib.util.find_spec("flask")),
         "bandit": bool(importlib.util.find_spec("bandit")),
         "playwright": bool(importlib.util.find_spec("playwright")),
+        "truststore": bool(importlib.util.find_spec("truststore")),
+        "tls_policy": "verified TLS; missing intermediates fetched from CA Issuers links with full verification; certificate strength policy enforced; unverified passive fallback is opt-in only",
+        "unverified_tls_diagnostics_enabled": unverified_tls_diagnostics_enabled(),
         "pytest": bool(importlib.util.find_spec("pytest")),
         "ai_reasoner": "offline-contextual",
         "patch_verification": True,
@@ -5219,13 +6952,22 @@ def diagnostics_api():
 
 @app.get("/health")
 def health_api():
-    return jsonify(status="ok", product="PatchProof", version="1.0 Self-Contained V8")
+    return jsonify(status="ok", product="PatchProof", version="1.4 V8 Verified TLS + Chain Repair + TLS Diagnostics")
+
+
+def _startup_dependency_hints():
+    import importlib.util
+    if not importlib.util.find_spec("truststore"):
+        print(" Tip: pip install truststore  (uses the OS certificate store, as browsers do)")
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 3 and sys.argv[1] == "--tls-check":
+        sys.exit(tls_check_cli(sys.argv[2]))
     print("==========================================================")
-    print(" PATCHPROOF V8 — Verified Security Workspace    ")
+    print(" PATCHPROOF V8 — Verified Security Workspace + Passive TLS Diagnostics    ")
     print(" Glassy Purple Edition with macOS Cursor & Live Sandbox   ")
     print(" Server running: http://127.0.0.1:5000                   ")
     print("==========================================================")
+    _startup_dependency_hints()
     app.run(host="127.0.0.1", port=5000, debug=False)
